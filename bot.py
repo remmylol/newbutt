@@ -32,7 +32,7 @@ load_dotenv()
 STARTING_CAPITAL = float(os.getenv("STARTING_CAPITAL_USD", "36"))
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() == "true"
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", "5"))
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "2"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
 POSITION_SIZE_USD = float(os.getenv("POSITION_SIZE_USD", "10"))  # Fixed paper position size in USD
 MAX_DAILY_LOSS_FRACTION = float(os.getenv("MAX_DAILY_LOSS_FRACTION", "0.5"))
 TAKE_PROFIT = float(os.getenv("TAKE_PROFIT_PCT", "0.20"))
