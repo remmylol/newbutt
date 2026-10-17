@@ -16,7 +16,8 @@ import time
 
 API = "https://api.dexpaprika.com/networks/solana/pools/search"
 MODES = ("price_change_percentage_5m", "price_change_percentage_1h",
-         "txns_24h", "volume_usd_24h", "created_at")
+         "price_change_percentage_5m", "txns_24h",
+         "price_change_percentage_5m", "volume_usd_24h")
 
 
 def number(value, default=0.0):
