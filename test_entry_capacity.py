@@ -29,7 +29,7 @@ def wire_scan(monkeypatch, tmp_path):
         'marketCap': 2000000,
         'pairCreatedAt': int((time.time() - 86400)*1000),
         'volume': {'m5': 40000, 'h1': 100000},
-        'priceChange': {'m5': 3, 'h1': 5, 'h6': 8, 'h24': 15},
+        'priceChange': {'m5': 3, 'h1': 8, 'h6': 8, 'h24': 15},
         'txns': {'m5': {'buys': 35, 'sells': 20}},
         'url': 'https://example.test/pool'
     }
@@ -49,6 +49,9 @@ def wire_scan(monkeypatch, tmp_path):
     monkeypatch.setattr(bot, 'CANDIDATE_QUALITY_ENABLED', True)
     monkeypatch.setattr(bot, 'ROLLING_DISCOVERY_ENABLED', True)
     monkeypatch.setattr(bot, 'PAPER_MODE', True)
+    monkeypatch.setattr(bot, 'MAX_POSITIONS', 2)  # legacy two-slot capacity regression
+    # Focus v4 capacity tests on slot scheduling. v5 snapshot tests live elsewhere.
+    monkeypatch.setattr(bot, 'PAPER_FINAL_SNAPSHOT_ENABLED', False)
     monkeypatch.setattr(bot, 'MOMENTUM_SWING_MODE', True)
     monkeypatch.setattr(bot, 'SNIPER_MODE', False)
     monkeypatch.setattr(bot, 'PAPER_SECONDARY_LIQUIDITY_ENABLED', False)
