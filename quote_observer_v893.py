@@ -1,8 +1,10 @@
 """Optional read-only Jupiter sell quote for research paper exits.
 
-Not a simulated live fill: entries are NOT confirmed buy swaps, raw units
-come from the paper price, and network fees/priority costs remain unverified.
-Never submit transactions; do not use the price result in paper accounting.
+Not a simulated live fill: entries are NOT confirmed buy swaps. Legacy
+research may use indicative price-based inventory; micro positions instead
+use minimum tokens from the verified same-pool Jupiter buy quote. The latter
+is still NOT confirmed inventory, and network/priority costs are unverified.
+Never submit transactions or treat quotes as guaranteed executed proceeds.
 """
 from __future__ import annotations
 from collections import deque
@@ -17,6 +19,10 @@ class QuoteObserver:
         self.api_key=api_key.strip();self.max_calls_per_minute=max(1,int(max_calls_per_minute))
         self.calls=deque();self.entry_cache={}
         self._executor=ThreadPoolExecutor(max_workers=2,thread_name_prefix='v893_jupiter')
+        # Micro exits are urgent: entry roundtrip work can take two network
+        # requests and must not occupy the workers reserved for exits.
+        self._micro_exit_executor=ThreadPoolExecutor(max_workers=2,
+            thread_name_prefix='v898_micro_exit')
         self._pending={};self.totals={'attempts':0,'quoted':0,'unverified':0}
     def entry_stats(self,now=None):
         """Non-sensitive read-only quote-budget diagnostics for micro audits."""
@@ -57,28 +63,103 @@ class QuoteObserver:
         except (requests.RequestException,ValueError,KeyError,TypeError,OverflowError):
             return {'status':'unverified_roundtrip_quote'}
 
+    @staticmethod
+    def _pinned_direct_route(quote, input_mint, output_mint, amount, pool):
+        """Validate actual token directions, input units and ONE explicit AMM."""
+        try:
+            plan=quote.get('routePlan') or []
+            return (isinstance(pool,str) and bool(pool) and
+                    quote.get('inputMint')==input_mint and
+                    quote.get('outputMint')==output_mint and
+                    int(quote.get('inAmount') or -1)==int(amount) and
+                    len(plan)==1 and
+                    (plan[0].get('swapInfo') or {}).get('ammKey')==pool and
+                    plan[0].get('percent') in (None,100))
+        except (TypeError,ValueError,OverflowError,AttributeError,IndexError):
+            return False
+
+    def _micro_roundtrip_network(self,mint,size,amount,sol_usd,pool,decimals,spot_usd):
+        """Micro-only exact-pool entry/exit check; never makes a swap."""
+        try:
+            headers={'x-api-key':self.api_key}
+            url='https://api.jup.ag/swap/v1/quote'
+            buy_response=requests.get(url,params={
+                'inputMint':SOL_MINT,'outputMint':mint,'amount':str(amount),
+                'slippageBps':'150','swapMode':'ExactIn','onlyDirectRoutes':'true'},
+                headers=headers,timeout=3)
+            buy_response.raise_for_status();buy=buy_response.json()
+            if not self._pinned_direct_route(buy,SOL_MINT,mint,amount,pool):
+                return {'status':'rejected_unpinned_micro_entry_route'}
+            gross_tokens=int(buy.get('outAmount') or 0)
+            minimum_tokens=int(buy.get('otherAmountThreshold') or 0)
+            if not 0<minimum_tokens<=gross_tokens:
+                return {'status':'unverified_minimum_entry_inventory'}
+            # Reject wildly inconsistent same-pool USD market marks. These
+            # are a reason to pause, not a licence to guess an entry fill.
+            expected_spot_usd=minimum_tokens/(10**decimals)*spot_usd
+            if (not math.isfinite(expected_spot_usd) or
+                    not size*.80<=expected_spot_usd<=size*1.20):
+                return {'status':'rejected_micro_entry_spot_quote_mismatch',
+                    'entry_min_inventory_spot_usd':round(expected_spot_usd,6)}
+            buy_impact=float(buy.get('priceImpactPct') if buy.get('priceImpactPct') is not None else 'nan')
+            if not math.isfinite(buy_impact) or buy_impact<0 or buy_impact>.03:
+                return {'status':'rejected_excessive_micro_buy_impact'}
+            # Conservative inventory: the minimum tokens that an entry could
+            # produce within slippage tolerance, NOT the optimistic quote output.
+            sell_response=requests.get(url,params={
+                'inputMint':mint,'outputMint':SOL_MINT,'amount':str(minimum_tokens),
+                'slippageBps':'150','swapMode':'ExactIn','onlyDirectRoutes':'true'},
+                headers=headers,timeout=3)
+            sell_response.raise_for_status();sell=sell_response.json()
+            if not self._pinned_direct_route(sell,mint,SOL_MINT,minimum_tokens,pool):
+                return {'status':'rejected_unpinned_micro_sell_route'}
+            sol_out=int(sell.get('outAmount') or 0)
+            sol_min=int(sell.get('otherAmountThreshold') or 0)
+            impact=float(sell.get('priceImpactPct') if sell.get('priceImpactPct') is not None else 'nan')
+            if not 0<sol_min<=sol_out or not math.isfinite(impact) or impact<0:
+                return {'status':'unverified_micro_sell_minimum_or_impact'}
+            if impact>.03:
+                return {'status':'rejected_excessive_micro_sell_impact'}
+            conservative_usd=sol_min/1e9*sol_usd
+            if not math.isfinite(conservative_usd) or conservative_usd<size*.92:
+                return {'status':'rejected_unfavorable_micro_minimum_roundtrip',
+                    'minimum_roundtrip_usd':round(conservative_usd,6)}
+            return {'status':'two_sided_jupiter_quotes_not_fills',
+                'pool':pool,'buy_token_raw_out':gross_tokens,
+                'buy_min_token_raw_out':minimum_tokens,
+                'minimum_roundtrip_usd':round(conservative_usd,6),
+                'gross_roundtrip_return_usd':round(sol_out/1e9*sol_usd,6),
+                'max_quote_impact_pct':round(max(buy_impact,impact)*100,4),
+                'entry_inventory_basis':'buy_minimum_quote_raw_not_fill',
+                'warning':'pinned_pool_read_only_quotes;minimum_inventory_and_sale_are_estimates_not_fills'}
+        except (requests.RequestException,ValueError,KeyError,TypeError,OverflowError,AttributeError):
+            return {'status':'unverified_micro_pinned_roundtrip'}
+
     def probe_micro_roundtrip(self,mint,size,decimals,pair,*,now=None):
         """Bounded transient quote retries for micro_0_60 only."""
         return self.probe_roundtrip(mint,size,decimals,pair,now=now,micro_fast_retry=True)
 
     def probe_roundtrip(self,mint,size,decimals,pair,*,now=None,micro_fast_retry=False):
         stamp=time.time() if now is None else now
-        cached=self.entry_cache.get(mint)
+        pool=pair.get('pairAddress') if micro_fast_retry and isinstance(pair,dict) else None
+        cache_key=(mint,pool) if micro_fast_retry else mint
+        cached=self.entry_cache.get(cache_key)
         if cached:
             # Recheck temporary quote-provider failures after bounded delay;
             # successful quotes retain their original 20-second TTL.
             transient=cached[1].get('status')=='unverified_roundtrip_quote'
-            ttl=15 if (transient and micro_fast_retry) else 20
+            ttl=(7 if transient else 10) if micro_fast_retry else 20
             if 0<=stamp-cached[0]<ttl:return cached[1]
-        pending=self._pending.get(mint)
+        pending=self._pending.get(cache_key)
         if pending:
             start,future=pending
             if not future.done():return {'status':'unverified_roundtrip_quote_pending'}
-            self._pending.pop(mint,None)
+            self._pending.pop(cache_key,None)
             try:result=future.result()
             except Exception:result={'status':'unverified_roundtrip_quote'}
-            if 0<=stamp-start<=25:
-                self.entry_cache[mint]=(stamp,result)
+            if 0<=stamp-start<=(10 if micro_fast_retry else 25):
+                # Age quotes from request start, not from delayed polling.
+                self.entry_cache[cache_key]=(start,result)
                 return result
         if not self.api_key:return {'status':'unverified_no_jupiter_key'}
         if not isinstance(decimals,int) or not 0<=decimals<=18:
@@ -94,7 +175,14 @@ class QuoteObserver:
         while self.calls and stamp-self.calls[0]>=60:self.calls.popleft()
         if len(self.calls)>=self.max_calls_per_minute:return {'status':'unverified_quote_budget'}
         self.calls.append(stamp)
-        self._pending[mint]=(stamp,self._executor.submit(self._roundtrip_network,mint,size,amount,sol_usd))
+        if micro_fast_retry:
+            if not isinstance(pool,str) or not pool:
+                return {'status':'unverified_micro_pool_address'}
+            work=self._executor.submit(self._micro_roundtrip_network,
+                                       mint,size,amount,sol_usd,pool,decimals,token_usd)
+        else:
+            work=self._executor.submit(self._roundtrip_network,mint,size,amount,sol_usd)
+        self._pending[cache_key]=(stamp,work)
         return {'status':'unverified_roundtrip_quote_pending'}
 
     def probe_sell(self,mint,entry_price,exit_price,size,decimals,pair,*,now=None):
@@ -143,23 +231,24 @@ class QuoteObserver:
                 'slippageBps':'150','swapMode':'ExactIn','onlyDirectRoutes':'true'},
                 headers={'x-api-key':self.api_key},timeout=3)
             r.raise_for_status();payload=r.json()
-            route=payload.get('routePlan') or []
-            if (payload.get('inputMint')!=mint or payload.get('outputMint')!=SOL_MINT or
-                    int(payload.get('inAmount') or -1)!=amount or len(route)!=1 or
-                    (route[0].get('swapInfo') or {}).get('ammKey')!=pool or
-                    route[0].get('percent') not in (None,100)):
+            if not self._pinned_direct_route(payload,mint,SOL_MINT,amount,pool):
                 return {'status':'unverified_pinned_pool_sell_route'}
             raw=int(payload.get('outAmount') or 0)
             minimum=int(payload.get('otherAmountThreshold') or 0)
             if not 0<minimum<=raw:return {'status':'unverified_minimum_sell_proceeds'}
-            impact=float(payload.get('priceImpactPct') or 'nan')
-            if not math.isfinite(impact) or impact<0 or impact>.10:
-                return {'status':'unverified_or_excessive_sell_impact'}
+            impact=float(payload.get('priceImpactPct') if payload.get('priceImpactPct') is not None else 'nan')
+            # A severe IMPACT is precisely when a held token may need an
+            # emergency exit. Don't turn a verified tiny sale quote into a
+            # fictitious pending position merely because the impact is large.
+            # Still reject nonsensical / unverified impact data.
+            if not math.isfinite(impact) or impact<0 or impact>1.:
+                return {'status':'unverified_or_invalid_sell_impact'}
             return {'status':'pinned_pool_sell_quote_not_fill',
                     'minimum_usd_out_estimate':round(minimum/1e9*sol_usd,8),
                     'minimum_sol_out_lamports':minimum,'quoted_sol_out_lamports':raw,
                     'token_amount_raw':amount,'pool':pool,
                     'price_impact_pct':impact*100,
+                    'severe_sell_impact_warning':impact>=.10,
                     'warning':'USD_conversion_and_paper_inventory_are_estimated;not_a_fill'}
         except (requests.RequestException,ValueError,TypeError,KeyError,OverflowError,IndexError):
             return {'status':'unverified_sell_quote_unavailable'}
@@ -170,7 +259,7 @@ class QuoteObserver:
         pool=rec.get('pool')
         buy=(rec.get('entry_route_quote') or
              (rec.get('research_risk_evidence') or {}).get('entry_route_quote') or {})
-        amount=buy.get('buy_token_raw_out')
+        amount=buy.get('buy_min_token_raw_out') or buy.get('buy_token_raw_out')
         if not isinstance(amount,int) or amount<=0:
             return {'status':'unverified_paper_entry_token_quantity'}
         try:
@@ -186,17 +275,25 @@ class QuoteObserver:
             self._micro_exit_pending={};self._micro_exit_cache={}
             self._micro_exit_calls=deque()
         key=(mint,pool,amount)
-        fut=self._micro_exit_pending.get(key)
-        if fut is not None:
+        pending=self._micro_exit_pending.get(key)
+        if pending is not None:
+            start,fut=pending
             if not fut.done():return {'status':'unverified_sell_quote_pending'}
             self._micro_exit_pending.pop(key,None)
             try:result=fut.result()
             except Exception:result={'status':'unverified_sell_quote_unavailable'}
-            self._micro_exit_cache[key]=(stamp,result)
-            return result
+            # Do not claim an old network quote is fresh simply because its
+            # Future was collected now; restart the request on next poll.
+            if not 0<=stamp-start<=7:
+                self._micro_exit_cache.pop(key,None)
+                return {'status':'unverified_stale_sell_quote'}
+            self._micro_exit_cache[key]=(start,result)
+            return dict(result,quote_age_seconds=round(stamp-start,3),
+                        quote_request_epoch=start)
         cached=self._micro_exit_cache.get(key)
-        if cached and stamp-cached[0]<3:
-            return cached[1]
+        if cached and 0<=stamp-cached[0]<=5:
+            return dict(cached[1],quote_age_seconds=round(stamp-cached[0],3),
+                        quote_request_epoch=cached[0])
         while self._micro_exit_calls and stamp-self._micro_exit_calls[0]>=60:
             self._micro_exit_calls.popleft()
         # Reserve four calls/min for mandatory age-five and risk-triggered
@@ -207,6 +304,6 @@ class QuoteObserver:
         if len(self._micro_exit_calls)>=(12 if urgent else 8):
             return {'status':'unverified_micro_sell_quote_budget'}
         self._micro_exit_calls.append(stamp)
-        self._micro_exit_pending[key]=self._executor.submit(
-            self._micro_sell_network,mint,pool,amount,sol_usd)
+        self._micro_exit_pending[key]=(stamp,self._micro_exit_executor.submit(
+            self._micro_sell_network,mint,pool,amount,sol_usd))
         return {'status':'unverified_sell_quote_pending'}

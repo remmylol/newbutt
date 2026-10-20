@@ -3,8 +3,9 @@
 The original portfolios trade separately from the legacy 5-12-minute paper
 ledger; v8.7.7 can promote the original 0_60 portfolio without changing its
 entry/exit thresholds, while disabling its automatic trading halts if requested.
-Quotes come from fresh, pinned DexScreener pools and are NOT verified
-executable prices. No quote => no invented exit.
+Legacy quoted prices come from pinned DexScreener pools. The micro paper
+track uses exact-pool Jupiter minimum-out quotes but those are NOT fills or
+guaranteed executable amounts. No fresh quote => no invented exit.
 """
 from __future__ import annotations
 
@@ -295,29 +296,81 @@ class AgeTrack:
             token_age=self.positions[mint]['entry_age_minutes']+elapsed/60.
             micro_age_exit=(self.name=='micro_0_60' and
                 rec['entry_age_minutes']<5. and token_age>=5.)
-            # Watch actual quote availability throughout the holding period,
-            # not just when a stop/age exit fires. The quote observer enforces
-            # its own bounded independent Jupiter budget (12/min).
+            # The $2 micro position is modeled using the conservative buy
+            # minimum and a freshly verified exact-pool sell minimum. Dex
+            # price-only returns are retained solely for comparison.
+            token_quote=None
             if (self.name=='micro_0_60' and self.research_quote_probe is not None and
                     hasattr(self.research_quote_probe,'probe_micro_sell')):
-                urgent_age=rec['entry_age_minutes']<5. and token_age>=4.75
+                # Pre-arm at 4m15s, not 4m45s; near the boundary the caller
+                # schedules frequent fresh-pool checks. No fabricated fills.
+                urgent_age=rec['entry_age_minutes']<5. and token_age>=4.25
                 if urgent_age:
                     rec['age_five_exit_prearmed']=True
-                if (urgent_age or
-                        stamp-float(rec.get('last_micro_sell_quote_check_at',0))>=25 or
-                        e['liquidity']<=rec['entry_liquidity']*.90):
+                last_poll=float(rec.get('last_micro_sell_quote_check_at',0))
+                quote_due=(urgent_age or stamp-last_poll>=12 or
+                           e['liquidity']<=rec['entry_liquidity']*.90 or
+                           bool(rec.get('pending_exit_reason')))
+                if quote_due:
                     rec['last_micro_sell_quote_check_at']=stamp
-                    probe=self.research_quote_probe.probe_micro_sell(mint,rec,pair,now=stamp)
-                    rec['held_sell_quote_status']=probe.get('status')
-                    if probe.get('status')=='pinned_pool_sell_quote_not_fill':
-                        rec['held_sell_min_usd_estimate']=probe.get('minimum_usd_out_estimate')
-            stop=net_pct<=-9.
+                    token_quote=self.research_quote_probe.probe_micro_sell(mint,rec,pair,now=stamp)
+                    rec['held_sell_quote_status']=token_quote.get('status')
+                    if token_quote.get('status')=='pinned_pool_sell_quote_not_fill':
+                        try:
+                            minimum=float(token_quote['minimum_usd_out_estimate'])
+                        except (TypeError,ValueError,KeyError,OverflowError):
+                            minimum=float('nan')
+                        age_seconds=float(token_quote.get('quote_age_seconds',float('inf')))
+                        if (math.isfinite(minimum) and minimum>=0 and
+                                0<=age_seconds<=7 and
+                                token_quote.get('pool')==rec['pool']):
+                            rec['held_sell_min_usd_estimate']=minimum
+                            rec['held_sell_min_quote_at']=stamp-age_seconds
+                            rec['held_sell_quote_return_pct']=round(
+                                (minimum/self.size-1)*100,4)
+                        else:
+                            rec['held_sell_quote_status']='unverified_sell_quote_metadata'
+                            token_quote=None
+            # On micro, exit thresholds use the verified sale minimum when
+            # available. The old Dex spot estimate is informational, not an
+            # exit-authorizing profit signal. Missing quotes may set a pending
+            # protective stop, never a virtual fill.
+            quoted_stop=False
+            quote_take_profit=False
+            quoted_reversal=False
+            prior_quote_peak=float(rec.get('peak_quoted_return_pct',float('-inf')))
+            recent_minimum=None
+            if self.name=='micro_0_60':
+                quote_time=float(rec.get('held_sell_min_quote_at',float('-inf')))
+                if 0<=stamp-quote_time<=7:
+                    quote_min=rec.get('held_sell_min_usd_estimate')
+                    if (isinstance(quote_min,(int,float)) and
+                            math.isfinite(quote_min) and quote_min>=0):
+                        recent_minimum=float(quote_min)
+                        pct=(recent_minimum/self.size-1)*100
+                        prev_peak=prior_quote_peak
+                        quoted_stop=pct<=-9.
+                        quote_take_profit=self.take_profit_enabled and pct>=self.take_profit_net_pct
+                        quoted_reversal=(self.exit_on_profitable_reversal and
+                            prev_peak>0 and prev_peak>=self.trailing_activation_net_pct and
+                            pct<=prev_peak-self.trailing_drawdown_pct_points and pct<prev_peak)
+                        rec['peak_quoted_return_pct']=max(prev_peak,pct)
+            # A price-only crash without a usable quote still triggers
+            # protective exit INTENT, but needs an actual quote before credit.
+            missing_quote_stop=(self.name=='micro_0_60' and
+                                recent_minimum is None and net_pct<=-9.)
+            stop=net_pct<=-9. if self.name!='micro_0_60' else False
             liquidity_loss=e['liquidity'] <= rec['entry_liquidity'] * .60
+            micro_profit=quote_take_profit if self.name=='micro_0_60' else (
+                self.take_profit_enabled and net_pct>=self.take_profit_net_pct)
+            micro_reversal=quoted_reversal if self.name=='micro_0_60' else profitable_reversal
             reason=('age_5m_mandatory_exit' if micro_age_exit else
+                    'protective_quoted_net_stop' if quoted_stop else
                     'protective_net_stop' if stop else
+                    'protective_unverified_spot_stop' if missing_quote_stop else
                     'liquidity_drop_40pct' if liquidity_loss else
-                    f'take_profit_{self.take_profit_net_pct:g}pct' if self.take_profit_enabled and net_pct>=self.take_profit_net_pct else
-                    'profitable_reversal' if profitable_reversal else
+                    f'take_profit_{self.take_profit_net_pct:g}pct' if micro_profit else
+                    'profitable_reversal' if micro_reversal else
                     'expiry_45m' if elapsed>=2700 else None)
             # Two separate confirmed snapshots showing a >20% on-chain SOL
             # reserve drawdown prompt a proactive exit intent. USD pool
@@ -341,18 +394,32 @@ class AgeTrack:
                         rec['exit_quote_status']='unverified_micro_sell_probe_not_installed'
                         self.changed=True
                         return 'pending_exit:'+reason
-                    quote=self.research_quote_probe.probe_micro_sell(mint,rec,pair,now=stamp)
-                    if quote.get('status')!='pinned_pool_sell_quote_not_fill':
+                    quote=(token_quote if token_quote is not None else
+                           self.research_quote_probe.probe_micro_sell(mint,rec,pair,now=stamp))
+                    # Also reject incomplete, stale and wrong-pool estimates.
+                    quote_age=quote.get('quote_age_seconds',float('inf'))
+                    try:
+                        min_quote=float(quote.get('minimum_usd_out_estimate'))
+                        quote_age=float(quote_age)
+                    except (TypeError,ValueError,OverflowError):
+                        min_quote=float('nan');quote_age=float('inf')
+                    if (quote.get('status')!='pinned_pool_sell_quote_not_fill' or
+                            quote.get('pool')!=rec['pool'] or
+                            not math.isfinite(min_quote) or min_quote<0 or
+                            not 0<=quote_age<=7):
                         rec['pending_exit_reason']=reason
                         rec['exit_quote_status']=quote.get('status','unverified_sell_quote')
                         self.changed=True
                         return 'pending_exit:'+reason
                     # Min quote out is still only an indicative estimate, not
                     # a fill guarantee. Never use Dex spot as sale proceeds.
-                    proceeds=max(0.,float(quote['minimum_usd_out_estimate']))
+                    proceeds=max(0.,min_quote)
                 else:
                     proceeds=max(0.,self.size*(1+net_pct/100))
                 self.cash+=proceeds
+                # For micro, the reported net percentage must correspond to
+                # the amount actually credited to *paper* cash, not Dex spot.
+                credited_return_pct=(proceeds/self.size-1)*100
                 closed_trade={'mint':mint,'symbol':rec.get('symbol',''),
                     'pool':rec['pool'],'opened_at':rec['opened_at'],'closed_at':stamp,
                     'entry_age_minutes':rec['entry_age_minutes'],
@@ -364,7 +431,9 @@ class AgeTrack:
                     'entry_5m_partial':rec['entry_5m_partial'],
                     'minutes_held':round(elapsed/60,3),'reason':reason,
                     'invested_usd':self.size,'proceeds_usd':round(proceeds,6),
-                    'pnl_usd':round(proceeds-self.size,6),'net_pct':round(net_pct,4),
+                    'pnl_usd':round(proceeds-self.size,6),
+                    'net_pct':round(credited_return_pct if self.name=='micro_0_60'
+                                    else net_pct,4),
                     'observations':rec['observations'],
                     'execution':('jupiter_pinned_pool_min_quote_paper_only_no_fill'
                                  if self.name=='micro_0_60' else
@@ -372,9 +441,24 @@ class AgeTrack:
                 if quote is not None:
                     closed_trade['execution_probe']=quote
                     closed_trade['price_only_modeled_net_pct']=round(net_pct,4)
+                    closed_trade['quote_based_estimated_return_pct']=round(credited_return_pct,4)
+                    closed_trade['quote_age_seconds']=round(float(quote.get('quote_age_seconds',float('inf'))),3)
+                    closed_trade['accounting_basis']='pinned_pool_minimum_quote_paper_no_fill'
+                    closed_trade['paper_accounting_revision']='v898'
+                    closed_trade['exit_signal_basis']='quoted_minimum_or_fallback_risk_intent'
+                    closed_trade['estimated_network_costs_usd']=None
+                    closed_trade['paper_entry_inventory_basis']=((rec.get('entry_route_quote') or
+                        (rec.get('research_risk_evidence') or {}).get('entry_route_quote') or
+                        {}).get('entry_inventory_basis','legacy_unverified_inventory'))
                 if reason=='profitable_reversal':
-                    closed_trade['prior_peak_net_pct']=round(prior_peak_net_pct,5)
-                    closed_trade['peak_to_exit_drop_pct_points']=round(prior_peak_net_pct-net_pct,5)
+                    if self.name=='micro_0_60':
+                        if math.isfinite(prior_quote_peak):
+                            closed_trade['prior_peak_quoted_return_pct']=round(prior_quote_peak,5)
+                            closed_trade['peak_to_exit_quote_drop_pct_points']=round(
+                                prior_quote_peak-credited_return_pct,5)
+                    else:
+                        closed_trade['prior_peak_net_pct']=round(prior_peak_net_pct,5)
+                        closed_trade['peak_to_exit_drop_pct_points']=round(prior_peak_net_pct-net_pct,5)
                 if self.name!='micro_0_60' and self.research_quote_probe is not None:
                     closed_trade['execution_probe']=self.research_quote_probe.probe_sell(
                         mint,rec['entry_price'],price,self.size,rec.get('token_decimals'),
@@ -472,6 +556,7 @@ class AgeTrack:
             'peak_net_pct':-6.,'observations':1,
             'research_risk_evidence':details,
             'entry_route_quote':details.get('entry_route_quote'),
+            'entry_quote_pool_verified':(details.get('entry_route_quote') or {}).get('pool')==e['pool'],
             'token_decimals':details.get('decimals')}
         if self.name=='micro_0_60' and e['age']>=8. and mint in self.seen:
             self.reentered_after8.add(mint)
@@ -518,6 +603,9 @@ class AgeTrack:
                 'blocked_age_band':'[5,8) minutes' if self.name=='micro_0_60' else None,
                 'micro_reentries_after8':len(self.reentered_after8),
                 'pending_micro_exits':sum(bool(v.get('pending_exit_reason')) for v in self.positions.values()) if self.name=='micro_0_60' else 0,
+                'v898_quote_accounted_closes':sum(r.get('paper_accounting_revision')=='v898' for r in self.closed) if self.name=='micro_0_60' else 0,
+                'v898_quote_stop_closes':sum(r.get('paper_accounting_revision')=='v898' and r.get('reason')=='protective_quoted_net_stop' for r in self.closed) if self.name=='micro_0_60' else 0,
+                'v898_pending_exit_statuses':{str(r.get('exit_quote_status','unspecified')):sum(1 for q in self.positions.values() if q.get('pending_exit_reason') and str(q.get('exit_quote_status','unspecified'))==str(r.get('exit_quote_status','unspecified'))) for r in self.positions.values() if r.get('pending_exit_reason')} if self.name=='micro_0_60' else {},
                 'exit_on_profitable_reversal':self.exit_on_profitable_reversal}
 
     def save(self):
@@ -735,11 +823,12 @@ class BackgroundAgeStudy:
         for mint,rec in micro.positions.items():
             age=float(rec.get('entry_age_minutes',60))+(stamp-float(rec['opened_at']))/60.
             if (rec.get('pending_exit_reason') or
-                (float(rec.get('entry_age_minutes',60))<5. and age>=4.75)):
+                (float(rec.get('entry_age_minutes',60))<5. and age>=4.25)):
                 last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))
                 if stamp-last>=3:
-                    pending.append((last,mint))
-        return [mint for _,mint in sorted(pending)[:limit]]
+                    pending.append((0 if rec.get('pending_exit_reason') else 1,
+                                    (5.-age if age<5. else 0),last,mint))
+        return [mint for *_,mint in sorted(pending)[:limit]]
 
     def missing(self,mint:str,*,now:float|None=None,micro_only:bool=False):
         stamp=time.time() if now is None else now

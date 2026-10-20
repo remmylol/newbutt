@@ -4292,20 +4292,26 @@ def run_background_age_study(*, scan_entries: bool) -> None:
         with _age_study_lock:
             if scan_entries:
                 normal_limit=min(3,SHADOW_AGE_STUDY_FETCH_PER_SCAN)
-                due_mints=_age_study.due(now=stamp,limit=normal_limit)
+                # Held mandatory exits get first look at available slots,
+                # before entry discovery and its less urgent callback queue.
+                urgent=_age_study.micro_urgent_held(now=stamp,limit=2)
+                due_mints=list(urgent)
+                extra_mints.update(urgent)
+                due_mints.extend(m for m in _age_study.due(now=stamp,limit=normal_limit)
+                                 if m not in extra_mints)
                 unscanned=_fresh_batch.stats().get('unscanned',0) if V893_RESEARCH_ENABLED else 0
                 # A quiet discovery backlog must NOT disable micro-only
                 # verification followups. Fill spare lookup slots with ready
                 # candidates regardless of batch-discovery queue depth.
                 if V893_RESEARCH_ENABLED and normal_limit<6:
-                    micro_extra=_age_study.micro_extra_due(now=stamp,limit=6-normal_limit,exclude=due_mints)
+                    micro_extra=_age_study.micro_extra_due(now=stamp,limit=max(0,6-len(due_mints)),exclude=due_mints)
                     extra_mints.update(micro_extra)
                     due_mints.extend(micro_extra)
                 log.info('V897 MICRO LOOKUP SCHEDULER backlog_unscanned=%d normal_budget=%d micro_extra=%d '
                          'total_selected=%d extra_even_without_discovery_backlog=True',
                          unscanned,normal_limit,len(extra_mints),len(due_mints))
-            elif V893_RESEARCH_ENABLED and len(_micro_fast_followup_window)<12:
-                allowance=min(2,12-len(_micro_fast_followup_window))
+            elif V893_RESEARCH_ENABLED and len(_micro_fast_followup_window)<24:
+                allowance=min(3,24-len(_micro_fast_followup_window))
                 urgent=_age_study.micro_urgent_held(now=stamp,limit=allowance)
                 follow=_age_study.micro_ready_followups(
                     now=stamp,limit=allowance,exclude=urgent)
@@ -4387,6 +4393,16 @@ def run_background_age_study(*, scan_entries: bool) -> None:
                              _v893_risk.max_rpc_per_minute,len(_v893_risk._pending),
                              _v893_quotes.entry_stats(),(_micro_v895_rug.stats() if _micro_v895_rug else None),
                              _age_study.micro_run_id)
+                    log.info('V898 MICRO EXIT INTEGRITY pinned_buy_sell_quotes=True '
+                             'conservative_buy_minimum_inventory=True held_quote_poll_12s=True '
+                             'maximum_quote_age_s=7 age5_prearm_min=4.25 '
+                             'quote_based_stop_usd=1.82 paper_accounting_revision=v898 '
+                             'paper_only=True run_id=%s closed_using_new_accounting=%d '
+                             'quoted_stop_closes=%d pending_exit_statuses=%s',
+                             _age_study.micro_run_id,
+                             report.get('v898_quote_accounted_closes',0),
+                             report.get('v898_quote_stop_closes',0),
+                             report.get('v898_pending_exit_statuses',{}))
                     log.info('V895 MICRO FILTER FUNNEL rejects=%s legacy_volume_would_block=%s minimum_5m_volume_usd=%s '
                              'minimum_change5_pct=0.8 minimum_buys5=10 minimum_sells5=1 '
                              'minimum_buy_sell_ratio=1.25 counts_are_attempts=True',
