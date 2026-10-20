@@ -229,6 +229,11 @@ class AgeTrack:
                 self.pending_followups[mint]=time.time() if now is None else now
             elif reason in ('research_risk:unverified_rpc_failure',
                             'research_route:unverified_roundtrip_quote',
+                          'research_route:unverified_micro_pinned_roundtrip',
+                          'research_route:unverified_quote_budget',
+                          'research_route:unverified_micro_pool_address',
+                          'research_route:unverified_minimum_entry_inventory',
+                          'research_route:unverified_micro_sell_minimum_or_impact',
                             'research_risk:unverified_missing_mint_account',
                           'research_risk:unverified_pool_check_pending',
                           'research_risk:unverified_pool_check_cooldown',
@@ -237,6 +242,13 @@ class AgeTrack:
                           'research_risk:unverified_lp_security_pending'):
                 self.pending_followups.pop(mint,None)
                 self.retry_after[mint]=(time.time() if now is None else now)+15
+            elif reason in ('research_route:rejected_unpinned_micro_entry_route',
+                            'research_route:rejected_unpinned_micro_sell_route'):
+                # Jupiter onlyDirectRoutes is not a pool pin. Retry later in
+                # case the best direct AMM changes, but NEVER accept a route
+                # through a pool that has not passed the same safety checks.
+                self.pending_followups.pop(mint,None)
+                self.retry_after[mint]=(time.time() if now is None else now)+30
             else:
                 self.pending_followups.pop(mint,None)
                 self.retry_after.pop(mint,None)
@@ -768,10 +780,17 @@ class BackgroundAgeStudy:
                 micro.pending_followups.pop(mint,None)
                 continue
             rpc=risk_pending.get(mint)
-            quote=quote_pending.get(mint)
+            # v8.9.8 keys quotes by (mint, selected_pool), whereas the old
+            # callback scheduler looked up mint alone, preventing rapid reuse
+            # of finished quotes until they had already expired. A completed
+            # future for this mint merely SCHEDULES a retry: the entry quote
+            # is still revalidated against the exact selected pool in observe.
+            quote_ready=any(
+                (key==mint or (isinstance(key,tuple) and len(key)>=1 and key[0]==mint))
+                and pending[1].done()
+                for key,pending in quote_pending.items())
             # Only completed futures are urgent; avoid hammering incomplete ones.
-            completed=(rpc is not None and rpc.done()) or (
-                quote is not None and quote[1].done()) or (
+            completed=(rpc is not None and rpc.done()) or quote_ready or (
                 rug_guard is not None and rug_guard.completed(mint))
             due_retry=stamp>=micro.retry_after.get(mint,float('inf'))
             last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))

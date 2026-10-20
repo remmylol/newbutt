@@ -23,13 +23,15 @@ class QuoteObserver:
         # requests and must not occupy the workers reserved for exits.
         self._micro_exit_executor=ThreadPoolExecutor(max_workers=2,
             thread_name_prefix='v898_micro_exit')
-        self._pending={};self.totals={'attempts':0,'quoted':0,'unverified':0}
+        self._pending={};self.micro_result_statuses={};self.totals={'attempts':0,'quoted':0,'unverified':0}
     def entry_stats(self,now=None):
         """Non-sensitive read-only quote-budget diagnostics for micro audits."""
         stamp=time.time() if now is None else now
         return {'max_roundtrips_per_minute':self.max_calls_per_minute,
                 'used_last_60s':sum(0<=stamp-t<60 for t in self.calls),
                 'pending_roundtrips':sum(not item[1].done() for item in self._pending.values()),
+                'ready_roundtrips':sum(item[1].done() for item in self._pending.values()),
+                'completed_micro_quote_statuses':dict(self.micro_result_statuses),
                 'cached_mints':len(self.entry_cache)}
 
     def _roundtrip_network(self,mint,size,amount,sol_usd):
@@ -157,6 +159,9 @@ class QuoteObserver:
             self._pending.pop(cache_key,None)
             try:result=future.result()
             except Exception:result={'status':'unverified_roundtrip_quote'}
+            if micro_fast_retry:
+                status=str(result.get('status','unknown'))
+                self.micro_result_statuses[status]=self.micro_result_statuses.get(status,0)+1
             if 0<=stamp-start<=(10 if micro_fast_retry else 25):
                 # Age quotes from request start, not from delayed polling.
                 self.entry_cache[cache_key]=(start,result)
