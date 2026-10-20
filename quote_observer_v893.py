@@ -160,7 +160,8 @@ class QuoteObserver:
         """Bounded nonblocking micro-only held-position exit quote polling."""
         stamp=time.time() if now is None else now
         pool=rec.get('pool')
-        buy=rec.get('entry_route_quote') or {}
+        buy=(rec.get('entry_route_quote') or
+             (rec.get('research_risk_evidence') or {}).get('entry_route_quote') or {})
         amount=buy.get('buy_token_raw_out')
         if not isinstance(amount,int) or amount<=0:
             return {'status':'unverified_paper_entry_token_quantity'}

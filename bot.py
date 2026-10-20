@@ -491,7 +491,7 @@ _quality_ledger = CandidateQualityLedger(STATE_FILE.with_name("candidate_quality
 _fresh_batch = FreshBatchQueue(STATE_FILE.with_name("fresh_batch_state.json"))
 _candidate_pipeline = CandidatePipeline(STATE_FILE.with_name("candidate_pipeline_v74_state.json"))
 _early_shadow_v80 = EarlyShadow(STATE_FILE.with_name("early_shadow_v80_state.json"))
-_micro_v895_rug = MicroRugGuard(SOLANA_RPC_URL) if V893_RESEARCH_ENABLED else None
+_micro_v895_rug = MicroRugGuard(SOLANA_RPC_URL,max_pool_checks_per_minute=24) if V893_RESEARCH_ENABLED else None
 _v893_risk = ResearchRiskGate(rpc_url=SOLANA_RPC_URL,
     strict=os.getenv('SHADOW_V893_REQUIRE_RPC_RISK','true').lower()=='true',
     max_rpc_per_minute=4,micro_rug_guard=_micro_v895_rug) if V893_RESEARCH_ENABLED else None
@@ -4365,9 +4365,14 @@ def run_background_age_study(*, scan_entries: bool) -> None:
                     log.info('V895 MICRO AGE+RUG AUDIT age_entry_allowed=0_to_under5_and_8_to_under60 '
                              'age5_exit_intent=True age5_unquoted_remains_pending=True '
                              'pending_exit_count=%d reentries_after8=%d pool_guard=%s '
-                             'no_verified_lp_or_holder_data_means_no_new_micro_entry=True',
+                             'no_verified_lp_or_holder_data_means_no_new_micro_entry=True micro_run_id=%s',
                              report.get('pending_micro_exits',0),report.get('micro_reentries_after8',0),
-                             (_micro_v895_rug.stats() if _micro_v895_rug else None))
+                             (_micro_v895_rug.stats() if _micro_v895_rug else None),_age_study.micro_run_id)
+                    log.info('V896 MICRO FRESH RUN ledger=%s starting_capital_usd=36.00 '
+                             'run_id=%s open=%d closed=%d cash_usd=%.2f '
+                             'old_micro_history_untouched=True',
+                             next(t.path for t in _age_study.tracks if t.name=='micro_0_60'),
+                             _age_study.micro_run_id,report['open'],report['closed'],report['cash_usd'])
                     log.info('V895 MICRO FILTER FUNNEL rejects=%s legacy_volume_would_block=%s minimum_5m_volume_usd=%s '
                              'minimum_change5_pct=0.8 minimum_buys5=10 minimum_sells5=1 '
                              'minimum_buy_sell_ratio=1.25 counts_are_attempts=True',

@@ -2,39 +2,89 @@
 
 Only the on-chain PumpSwap Pool layout is supported. Unknown DEX/pool,
 LP-control, holder owners or reserve history fail closed for *micro_0_60*.
-No real orders, no invented safe/locked LP status. Zero LP token supply
-alone is evidence of burned LP tokens, not a guarantee against market dumps.
+No real orders, no invented safe/locked LP status. At least 99% of
+the historical PumpSwap LP supply must be provably burned; remaining
+withdrawal control is not assumed safe and dumps can still occur.
 """
 from __future__ import annotations
 
 from collections import Counter, deque
+import base64
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import math
 import time
 
-from read_only_exit_v872 import pump_pool_snapshot, _rpc, b58encode, valid_pubkey, PUMP_AMM_PROGRAM
+from read_only_exit_v872 import (_rpc, b58encode, valid_pubkey, PUMP_AMM_PROGRAM,
+    PUMP_POOL_DISCRIMINATOR, SOL)
 
 log=logging.getLogger(__name__)
 
 class MicroRugGuard:
     def __init__(self,rpc_url,*,snapshot_loader=None,security_loader=None,
-                 max_pool_checks_per_minute=6):
+                 max_pool_checks_per_minute=24):
         self.rpc_url=rpc_url
         self.snapshot_loader=snapshot_loader or self._snapshot
         self.security_loader=security_loader or self._security
-        self._executor=ThreadPoolExecutor(max_workers=2,thread_name_prefix='micro_rug')
+        self._executor=ThreadPoolExecutor(max_workers=4,thread_name_prefix='micro_rug')
         self._pending={};self._last={};self._security_cache={};self._security_pending={}
-        self.history={};self.reasons=Counter()
+        self.history={};self.reasons=Counter();self._snapshot_cache={}
         self.max_pool_checks_per_minute=max(1,int(max_pool_checks_per_minute))
         self._checks=deque()
 
     def _snapshot(self,mint,pool,dex):
+        """Normalize SOL/token by *mint identity*, not base/quote order.
+
+        Require PumpSwap account owner+discriminator, exact token pairing,
+        and independently parsed vault mint identities. Unsupported layouts
+        and non-WSOL pairs remain denied.
+        """
         if str(dex).lower()!='pumpswap':raise ValueError('unsupported_pool_adapter')
-        snap=pump_pool_snapshot(self.rpc_url,pool,mint)
-        return {'pool':pool,'mint':mint,'sol_vault_raw':snap.quote_raw,
-                'token_vault_raw':snap.base_raw,'slot':snap.slot,
-                'base_vault':snap.base_vault,'quote_vault':snap.quote_vault}
+        result=_rpc(self.rpc_url,'getAccountInfo',[pool,{'encoding':'base64','commitment':'confirmed'}])
+        acct=result.get('value')
+        if not isinstance(acct,dict) or acct.get('owner')!=PUMP_AMM_PROGRAM:
+            raise ValueError('unverified_pool_owner')
+        encoded=acct.get('data') or []
+        if not isinstance(encoded,list) or len(encoded)<2 or encoded[1]!='base64':
+            raise ValueError('unverified_pool_encoding')
+        raw=base64.b64decode(encoded[0],validate=True)
+        if len(raw)<211 or raw[:8]!=PUMP_POOL_DISCRIMINATOR:
+            raise ValueError('unverified_pool_layout')
+        bm,qm=b58encode(raw[43:75]),b58encode(raw[75:107])
+        if (bm,qm)==(mint,SOL):reversed_pair=False
+        elif (bm,qm)==(SOL,mint):reversed_pair=True
+        else:raise ValueError('pool_mint_identity_mismatch')
+        a,b=b58encode(raw[139:171]),b58encode(raw[171:203])
+        if a==b or not valid_pubkey(a) or not valid_pubkey(b):
+            raise ValueError('unverified_vault_addresses')
+        balances=_rpc(self.rpc_url,'getMultipleAccounts',[[a,b],{
+            'encoding':'jsonParsed','commitment':'confirmed'}])
+        values=balances.get('value')
+        if not isinstance(values,list) or len(values)!=2:
+            raise ValueError('unverified_vault_accounts')
+        amounts=[]
+        for v,expected in zip(values,(bm,qm)):
+            if not isinstance(v,dict):raise ValueError('unverified_vault_account')
+            parsed=((v.get('data') or {}).get('parsed') or {})
+            info=parsed.get('info') or {}
+            if parsed.get('type')!='account' or info.get('mint')!=expected:
+                raise ValueError('pool_vault_mint_mismatch')
+            if v.get('owner') not in ('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+                                     'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'):
+                raise ValueError('unverified_vault_token_program')
+            amount=int((info.get('tokenAmount') or {})['amount'])
+            if amount<0:raise ValueError('unverified_vault_balance')
+            amounts.append(amount)
+        pool_slot=int((result.get('context') or {}).get('slot') or 0)
+        vault_slot=int((balances.get('context') or {}).get('slot') or 0)
+        if pool_slot<=0 or vault_slot<=0 or abs(pool_slot-vault_slot)>150:
+            raise ValueError('unverified_rpc_slot_gap')
+        return {'pool':pool,'mint':mint,'sol_vault_raw':amounts[0 if reversed_pair else 1],
+                'token_vault_raw':amounts[1 if reversed_pair else 0],
+                'slot':max(pool_slot,vault_slot),
+                'base_vault':b if reversed_pair else a,  # semantic TOKEN vault
+                'quote_vault':a if reversed_pair else b, # semantic WSOL vault
+                'reversed_pool_orientation':reversed_pair}
 
     def _security(self,mint,pool,dex,snapshot):
         if str(dex).lower()!='pumpswap':raise ValueError('unsupported_pool_adapter')
@@ -42,20 +92,34 @@ class MicroRugGuard:
         # Parsed and validated PumpSwap Pool layout already checked in snapshot.
         if not isinstance(info,dict) or info.get('owner')!=PUMP_AMM_PROGRAM:
             raise ValueError('unverified_pool_owner')
-        import base64
         raw=base64.b64decode(info['data'][0],validate=True)
+        if raw[:8]!=PUMP_POOL_DISCRIMINATOR:raise ValueError('unverified_pool_layout')
+        bm,qm=b58encode(raw[43:75]),b58encode(raw[75:107])
+        if not ((bm,qm)==(mint,SOL) or (bm,qm)==(SOL,mint)):
+            raise ValueError('pool_mint_identity_mismatch')
         if len(raw)<235:raise ValueError('unverified_lp_mint_layout')
         lp_mint=b58encode(raw[107:139])
         creator=b58encode(raw[11:43])
         if not valid_pubkey(lp_mint) or not valid_pubkey(creator):
             raise ValueError('unverified_pool_control_address')
-        # Only positively proven all-burned LP is accepted; a locked LP
-        # position requires a protocol-specific locker decoder not present.
-        lp_supply=int(_rpc(self.rpc_url,'getTokenSupply',[lp_mint,{'commitment':'confirmed'}])['value']['amount'])
-        if lp_supply!=0:
+        # PumpSwap Pool.lp_supply tracks minted LP *before direct burns*.
+        # A tiny still-circulating share is NOT equivalent to a locked LP.
+        # Allow only >=99% cryptographically burned; otherwise unverified.
+        total_lp_supply=int.from_bytes(raw[203:211],'little')
+        outstanding=int(_rpc(self.rpc_url,'getTokenSupply',[
+            lp_mint,{'commitment':'confirmed'}])['value']['amount'])
+        if total_lp_supply<=0 or outstanding<0 or outstanding>total_lp_supply:
+            raise ValueError('unverified_lp_supply_consistency')
+        burned_pct=100*(1-outstanding/total_lp_supply)
+        if burned_pct<99.:
             return {'status':'unverified_lp_withdrawal_control','pool_creator':creator,
-                    'lp_mint':lp_mint,'lp_supply_raw':lp_supply,
-                    'reason':'nonzero_lp_requires_verified_lock_owner'}
+                    'lp_mint':lp_mint,'lp_supply_raw':outstanding,
+                    'historical_lp_supply_raw':total_lp_supply,
+                    'burned_lp_pct':round(burned_pct,3),
+                    'reason':'cannot_prove_at_least_99pct_lp_burned_or_lock_verified'}
+        # This confirms only burned shares. Unburned balances held in an
+        # alleged locker stay counted as withdrawable until a separate
+        # protocol-specific lock adapter proves the beneficiary and unlock.
         token_supply=int(_rpc(self.rpc_url,'getTokenSupply',[mint,{'commitment':'confirmed'}])['value']['amount'])
         if token_supply<=0:raise ValueError('unverified_mint_supply')
         top=_rpc(self.rpc_url,'getTokenLargestAccounts',[mint,{'commitment':'confirmed'}])['value']
@@ -85,6 +149,8 @@ class MicroRugGuard:
                     'warning':'related_wallets_not_fully_identifiable'}
         return {'status':'verified_burned_lp_and_screened_holders',
                 'pool_creator':creator,'lp_mint':lp_mint,
+                'burned_lp_pct':round(burned_pct,3),
+                'unburned_lp_pct':round(100-burned_pct,3),
                 'largest_owner_pct':round(largest*100,2),
                 'top5_owner_pct':round(top_five*100,2),
                 'creator_wallet_pct':round(creator_share*100,2),
@@ -112,56 +178,62 @@ class MicroRugGuard:
             return False,'unverified_pool_identity',{}
         key=(mint,pool)
         task=self._pending.get(key)
-        if task is None:
-            last=self._last.get(key,0)
-            if now-last<5:
-                return False,'unverified_pool_check_cooldown',{}
-            while self._checks and now-self._checks[0]>=60:
-                self._checks.popleft()
-            if len(self._checks)>=self.max_pool_checks_per_minute:
-                return False,'unverified_pool_security_budget',{}
-            self._checks.append(now)
-            self._last[key]=now
-            self._pending[key]=self._executor.submit(self._refresh,mint,pool,dex)
+        if task is not None and task.done():
+            self._pending.pop(key,None)
+            try:result=task.result()
+            except Exception:result={'status':'unverified_pool_security'}
+            if result.get('status')!='snapshot_ok':
+                why=result.get('status','unverified_pool_security')
+                self.reasons[why]+=1
+                return False,why,result
+            self._snapshot_cache[key]=(now,result['snapshot'])
+        cached=self._snapshot_cache.get(key)
+        # Consume completed results immediately and use a fresh snapshot for
+        # LP checks instead of re-queueing an RPC request each observation.
+        fresh=bool(cached and 0<=now-cached[0]<=18)
+        if task is not None and not task.done() and not fresh:
             return False,'unverified_pool_check_pending',{}
-        if not task.done():return False,'unverified_pool_check_pending',{}
-        self._pending.pop(key,None)
-        result=task.result()
-        if result.get('status')!='snapshot_ok':
-            why=result.get('status','unverified_pool_security')
-            self.reasons[why]+=1
-            return False,why,result
-        snap=result['snapshot']
+        if not fresh:
+            if task is None or task.done():
+                last=self._last.get(key,0)
+                if now-last<12:return False,'unverified_pool_check_cooldown',{}
+                while self._checks and now-self._checks[0]>=60:
+                    self._checks.popleft()
+                if len(self._checks)>=self.max_pool_checks_per_minute:
+                    return False,'unverified_pool_security_budget',{}
+                self._checks.append(now);self._last[key]=now
+                self._pending[key]=self._executor.submit(self._refresh,mint,pool,dex)
+            return False,'unverified_pool_check_pending',{}
+        snapshot_time,snap=cached
         hist=self.history.setdefault(key,deque(maxlen=32))
-        if not hist or now-hist[-1][0]>=5:hist.append((now,int(snap['sol_vault_raw']),int(snap['token_vault_raw'])))
-        prior=[row for row in hist if 60<=now-row[0]<=130]
+        if not hist or snapshot_time-hist[-1][0]>=5:
+            hist.append((snapshot_time,int(snap['sol_vault_raw']),int(snap['token_vault_raw'])))
+        prior=[row for row in hist if 60<=snapshot_time-row[0]<=130]
         if not prior:
             self.reasons['unverified_60s_reserve_history']+=1
-            return False,'unverified_60s_reserve_history',result
+            return False,'unverified_60s_reserve_history',{'snapshot':snap}
         older=max(prior,key=lambda row:row[0])
-        quote_decline=1.-int(snap['sol_vault_raw'])/max(1,older[1])
-        result['sol_reserve_decline_pct']=round(100*quote_decline,3)
-        if quote_decline>=.10:
+        decline=1.-int(snap['sol_vault_raw'])/max(1,older[1])
+        result={'snapshot':snap,'status':'snapshot_ok',
+                'sol_reserve_decline_pct':round(100*decline,3)}
+        if decline>=.10:
             log.warning('MICRO RUG SOL VAULT DECLINE mint=%s pool=%s decline_pct=%.2f warning_at_10pct=True',
-                        mint,pool,100*quote_decline)
-        if quote_decline>=.20:
+                        mint,pool,100*decline)
+        if decline>=.20:
             self.reasons['verified_sol_reserve_decline_20pct']+=1
             return False,'verified_sol_reserve_decline_20pct',result
         cache=self._security_cache.get(key)
-        if cache and now-cache[0]<30:
+        if cache and 0<=now-cache[0]<60:
             security=cache[1]
         else:
             fut=self._security_pending.get(key)
             if fut is None:
-                self._security_pending[key]=self._executor.submit(
-                    self._security_check,mint,pool,dex,snap)
+                self._security_pending[key]=self._executor.submit(self._security_check,mint,pool,dex,snap)
                 return False,'unverified_lp_security_pending',result
-            if not fut.done():
-                return False,'unverified_lp_security_pending',result
+            if not fut.done():return False,'unverified_lp_security_pending',result
             self._security_pending.pop(key,None)
             try:security=fut.result()
-            except Exception as exc:
-                security={'status':'unverified_lp_or_holder_security','detail':type(exc).__name__}
+            except Exception as exc:security={'status':'unverified_lp_or_holder_security','detail':type(exc).__name__}
             self._security_cache[key]=(now,security)
         result['security']=security
         status=security.get('status')
@@ -179,4 +251,5 @@ class MicroRugGuard:
                 'pending_pool_checks':len(self._pending),
                 'pending_lp_holder_checks':len(self._security_pending),
                 'pool_checks_per_minute_limit':self.max_pool_checks_per_minute,
-                'locked_lp_adapters_not_supported':'only_burned_lp_pumpswap_verified'}
+                'lock_contract_adapter':'not_supported; >=99pct proven_burned LP only',
+                'fresh_snapshot_cache_size':len(self._snapshot_cache)}

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -534,6 +536,13 @@ class BackgroundAgeStudy:
                  max_entry_market_cap_usd:float | None=None,
                  enable_v893_research: bool=False, research_guard=None, research_quote_probe=None):
         base=Path(state_file)
+        # v8.9.6 fresh micro-only experiment. Distinct name means old stuck
+        # inventory/closed trades are NOT imported or falsely realized.
+        # Re-deploys of the same run retain this new ledger without resetting.
+        micro_run_id=os.getenv('MICRO_0_60_RUN_ID','v896_fresh36_run001')
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',micro_run_id):
+            raise ValueError('invalid_micro_0_60_run_id')
+        self.micro_run_id=micro_run_id
         self.tracks=[AgeTrack(name=name,min_age=min_age,
             path=base.with_name(f'age_study_{name}_{base.stem}.json'),
             starting_capital=starting_capital,
@@ -551,8 +560,9 @@ class BackgroundAgeStudy:
                     ('adaptive_0_60',35000.,15000.,16.),
                     ('micro_0_60',3000.,1000.,None)):
                 self.tracks.append(AgeTrack(name=name,min_age=0.,
-                    path=base.with_name(f'age_study_{name}_{base.stem}.json'),
-                    starting_capital=starting_capital,halts_enabled=False,
+                    path=base.with_name(f'age_study_{name}_{base.stem}__{micro_run_id}.json')
+                         if name=='micro_0_60' else base.with_name(f'age_study_{name}_{base.stem}.json'),
+                    starting_capital=36. if name=='micro_0_60' else starting_capital,halts_enabled=False,
                     take_profit_net_pct=25.,exit_on_profitable_reversal=True,
                     max_entry_market_cap_usd=max_entry_market_cap_usd,
                     min_entry_market_cap_usd=cap,
