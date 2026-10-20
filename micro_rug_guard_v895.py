@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 import math
 import time
+import requests
 
 from read_only_exit_v872 import (_rpc, b58encode, valid_pubkey, PUMP_AMM_PROGRAM,
     PUMP_POOL_DISCRIMINATOR, SOL)
@@ -38,6 +39,10 @@ class MicroRugGuard:
         self.security_negative_cache_hits=0
         self.completed_futures_pruned=0
         self._last_prune=0.
+        self._snapshot_failures={}
+        self.callbacks_consumed_snapshot=0
+        self.callbacks_consumed_lp=0
+        self.transient_provider_failures=0
 
     def _snapshot(self,mint,pool,dex):
         """Normalize SOL/token by *mint identity*, not base/quote order.
@@ -206,6 +211,16 @@ class MicroRugGuard:
                     int(snap['sol_vault_raw'])<=0 or int(snap['token_vault_raw'])<=0):
                 return {'status':'unverified_pool_reserves'}
             return {'status':'snapshot_ok','snapshot':snap}
+        except requests.RequestException as exc:
+            return {'status':'unverified_pool_rpc_unavailable','detail':type(exc).__name__}
+        except ValueError as exc:
+            # A malformed provider response is transient. A verified bad pool
+            # owner, discriminator or mint remains a strict security failure.
+            detail=str(exc)[:96]
+            status=('unverified_pool_rpc_unavailable' if detail in
+                    ('rpc_invalid_response','rpc_https_required') else
+                    'unverified_pool_security')
+            return {'status':status,'detail':detail}
         except Exception as exc:
             return {'status':'unverified_pool_security','detail':type(exc).__name__}
 
@@ -233,6 +248,80 @@ class MicroRugGuard:
         if status and key[0] and key[1]:
             self._unique_statuses.setdefault(key,set()).add(status)
 
+    def drain_completed(self,now):
+        """Read-only callback drain; call from scanner even without market results."""
+        self._harvest_finished(now)
+
+    def _harvest_finished(self,now):
+        """Consume completed RPC futures independent of candidate re-scans.
+
+        Submitted snapshots are timestamped at request START, not at callback
+        consumption; a late result cannot be laundered into a fresh sample.
+        Successful LP evidence is cached but still requires new reserve data,
+        mint checks, age checks, momentum and Jupiter quotes at entry.
+        """
+        for key,task in list(self._pending.items())[:32]:
+            if not task.done():
+                continue
+            self._pending.pop(key,None)
+            self.callbacks_consumed_snapshot+=1
+            start=self._last.get(key,now)
+            try:result=task.result()
+            except Exception as exc:
+                result={'status':'unverified_pool_rpc_unavailable',
+                        'detail':type(exc).__name__}
+            status=result.get('status','unverified_pool_security')
+            if status=='snapshot_ok':
+                snap=result.get('snapshot') or {}
+                if (0<=now-start<=18 and snap.get('pool')==key[1] and
+                        snap.get('mint')==key[0] and
+                        int(snap.get('sol_vault_raw') or 0)>0 and
+                        int(snap.get('token_vault_raw') or 0)>0):
+                    self._snapshot_cache[key]=(start,snap)
+                    self._snapshot_failures.pop(key,None)
+                    hist=self.history.setdefault(key,deque(maxlen=32))
+                    if not hist or start-hist[-1][0]>=5:
+                        hist.append((start,int(snap['sol_vault_raw']),
+                                     int(snap['token_vault_raw'])))
+                # A delayed response is NOT fresh; queue a new on-chain read.
+            else:
+                self._snapshot_failures[key]=(now,result)
+                self._note_unique(key,status)
+                self.reasons[status]+=1
+                if status=='unverified_pool_rpc_unavailable':
+                    self.transient_provider_failures+=1
+            log.info('V902 MICRO SECURITY CALLBACK pool=%s mint=%s stage=snapshot status=%s',
+                     key[1],key[0],status)
+        for key,task in list(self._security_pending.items())[:32]:
+            if not task.done():
+                continue
+            self._security_pending.pop(key,None)
+            self.callbacks_consumed_lp+=1
+            # LP input was a verified snapshot, so the verdict cannot be
+            # considered newer than that snapshot or its RPC lookup.
+            start=self._snapshot_cache.get(key,(now,))[0]
+            try:verdict=task.result()
+            except Exception as exc:
+                verdict={'status':'unverified_lp_or_holder_security',
+                         'detail':type(exc).__name__}
+            if not isinstance(verdict,dict):
+                verdict={'status':'unverified_lp_or_holder_security'}
+            status=verdict.get('status','unverified_lp_or_holder_security')
+            if 0<=now-start<=120:
+                self._security_cache[key]=(start,verdict)
+            self._note_unique(key,status)
+            log.info('V902 MICRO SECURITY CALLBACK pool=%s mint=%s stage=lp_holders status=%s',
+                     key[1],key[0],status)
+
+    def prioritized_verified_mints(self,now):
+        """Scheduling hints, never an entry authorization."""
+        found={}
+        for (mint,pool),(seen,record) in self._security_cache.items():
+            if (record.get('status')=='verified_burned_lp_and_screened_holders'
+                    and 0<=now-seen<=120):
+                found[mint]=max(seen,found.get(mint,float('-inf')))
+        return [mint for mint,_ in sorted(found.items(),key=lambda item:-item[1])]
+
     def _prune_futures(self,now):
         # A completed result for a candidate no longer revisited should not
         # inflate pending counts indefinitely. Do not cancel active requests.
@@ -256,6 +345,7 @@ class MicroRugGuard:
         """
         self.prefetch_attempts+=1
         key=((pair.get('baseToken') or {}).get('address'),pair.get('pairAddress'))
+        self._harvest_finished(now)
         self._prune_futures(now)
         verdict=self._negative_cached(key,now)
         if verdict:
@@ -273,6 +363,7 @@ class MicroRugGuard:
         if not valid_pubkey(mint) or not valid_pubkey(pool):
             return False,'unverified_pool_identity',{}
         key=(mint,pool)
+        self._harvest_finished(now)
         self._prune_futures(now)
         # Also cover entry-side check() calls (not only prefetch). A known
         # unverified locker may never be interpreted as a positive LP pass.
@@ -300,6 +391,15 @@ class MicroRugGuard:
                     self._security_cache.pop(old_key,None)
                     self._unique_statuses.pop(old_key,None)
                     self._last.pop(old_key,None)
+        transient=self._snapshot_failures.get(key)
+        if transient:
+            seen,verdict=transient
+            failure=verdict.get('status','unverified_pool_security')
+            ttl=8 if failure=='unverified_pool_rpc_unavailable' else 45
+            if 0<=now-seen<ttl:
+                return False,failure,{'pool_security':verdict,
+                                      'retry_after':seen+ttl}
+            self._snapshot_failures.pop(key,None)
         cached=self._snapshot_cache.get(key)
         # Consume completed results immediately and use a fresh snapshot for
         # LP checks instead of re-queueing an RPC request each observation.
@@ -412,4 +512,8 @@ class MicroRugGuard:
                 'fresh_snapshot_cache_size':len(self._snapshot_cache),
                 'prefetch_attempts':self.prefetch_attempts,
                 'prefetch_submitted':self.prefetch_submitted,
-                'security_results_cached':len(self._security_cache)}
+                'security_results_cached':len(self._security_cache),
+                'v902_callbacks_consumed_snapshot':self.callbacks_consumed_snapshot,
+                'v902_callbacks_consumed_lp':self.callbacks_consumed_lp,
+                'v902_transient_provider_failures':self.transient_provider_failures,
+                'v902_cached_snapshot_failures':len(self._snapshot_failures)}

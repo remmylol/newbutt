@@ -4280,6 +4280,12 @@ def run_background_age_study(*, scan_entries: bool) -> None:
     if not SHADOW_AGE_STUDY_ENABLED:
         return
     stamp=time.time()
+    # v9.0.2: Drain completed on-chain checks even when there are no fresh
+    # DexScreener pairs or no entry scan. Does not authorize an entry or
+    # fabricate a pool snapshot; every purchase still runs fresh gates.
+    if _micro_v895_rug is not None and hasattr(_micro_v895_rug,'drain_completed'):
+        with _age_study_lock:
+            _micro_v895_rug.drain_completed(stamp)
     # Standard 3-study lookups stay unchanged. Under a genuine discovery
     # backlog, add up to three MICRO-ONLY lookups; never expand other tracks.
     # A completed async RPC/Jupiter result can also prompt a fresh-pair

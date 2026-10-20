@@ -9,10 +9,12 @@ Never submit transactions or treat quotes as guaranteed executed proceeds.
 from __future__ import annotations
 from collections import deque
 import math
+import logging
 import time
 import requests
 from concurrent.futures import ThreadPoolExecutor
 
+v902_log=logging.getLogger(__name__)
 SOL_MINT='So11111111111111111111111111111111111111112'
 class QuoteObserver:
     def __init__(self,api_key='',*,max_calls_per_minute=3):
@@ -102,6 +104,12 @@ class QuoteObserver:
             if (not math.isfinite(expected_spot_usd) or
                     not size*.80<=expected_spot_usd<=size*1.20):
                 return {'status':'rejected_micro_entry_spot_quote_mismatch',
+                    'pool':pool, 'spot_price_usd':round(spot_usd,12),
+                    'token_decimals':decimals,
+                    'expected_spot_value_usd':round(expected_spot_usd,6),
+                    'nominal_entry_size_usd':round(size,6),
+                    'spot_value_to_entry_ratio':round(expected_spot_usd/size,5),
+                    'allowed_ratio_range':[.80,1.20],
                     'entry_min_inventory_spot_usd':round(expected_spot_usd,6)}
             buy_impact=float(buy.get('priceImpactPct') if buy.get('priceImpactPct') is not None else 'nan')
             if not math.isfinite(buy_impact) or buy_impact<0 or buy_impact>.03:
@@ -162,6 +170,13 @@ class QuoteObserver:
             if micro_fast_retry:
                 status=str(result.get('status','unknown'))
                 self.micro_result_statuses[status]=self.micro_result_statuses.get(status,0)+1
+                if status=='rejected_micro_entry_spot_quote_mismatch':
+                    v902_log.warning('V902 MICRO ENTRY QUOTE MISMATCH pool=%s mint=%s '
+                        'nominal_usd=%s spot_min_value_usd=%s ratio=%s '
+                        'limit_low=0.80 limit_high=1.20 no_paper_buy=True',
+                        pool,mint,result.get('nominal_entry_size_usd'),
+                        result.get('entry_min_inventory_spot_usd'),
+                        result.get('spot_value_to_entry_ratio'))
             if 0<=stamp-start<=(10 if micro_fast_retry else 25):
                 # Age quotes from request start, not from delayed polling.
                 self.entry_cache[cache_key]=(start,result)
