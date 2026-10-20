@@ -49,10 +49,19 @@ class QuoteObserver:
         except (requests.RequestException,ValueError,KeyError,TypeError,OverflowError):
             return {'status':'unverified_roundtrip_quote'}
 
-    def probe_roundtrip(self,mint,size,decimals,pair,*,now=None):
+    def probe_micro_roundtrip(self,mint,size,decimals,pair,*,now=None):
+        """Bounded transient quote retries for micro_0_60 only."""
+        return self.probe_roundtrip(mint,size,decimals,pair,now=now,micro_fast_retry=True)
+
+    def probe_roundtrip(self,mint,size,decimals,pair,*,now=None,micro_fast_retry=False):
         stamp=time.time() if now is None else now
         cached=self.entry_cache.get(mint)
-        if cached and 0<=stamp-cached[0]<20:return cached[1]
+        if cached:
+            # Recheck temporary quote-provider failures after bounded delay;
+            # successful quotes retain their original 20-second TTL.
+            transient=cached[1].get('status')=='unverified_roundtrip_quote'
+            ttl=15 if (transient and micro_fast_retry) else 20
+            if 0<=stamp-cached[0]<ttl:return cached[1]
         pending=self._pending.get(mint)
         if pending:
             start,future=pending

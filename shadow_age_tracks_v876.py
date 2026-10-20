@@ -21,26 +21,53 @@ from early_watch_shadow_v80 import (pool_evidence, SHADOW_MIN_CAP_USD,
 from rolling_discovery import MINT_PATTERN
 
 
-def valid_flow(pair: dict, e: dict, *, surge_change: float=13.5, surge_volume: float=2500.,
-               min_cap: float=SHADOW_MIN_CAP_USD,
-               max_change: float | None=SHADOW_MAX_5M_CHANGE_PCT) -> bool:
-    """Use the original measured flow thresholds, plus v8.7.5 health gate.
+def flow_filter_reasons(pair: dict, e: dict, *, surge_change: float=13.5,
+                        surge_volume: float=2500.,
+                        min_cap: float=SHADOW_MIN_CAP_USD,
+                        min_volume5_usd: float | None=SHADOW_MIN_5M_VOLUME_USD,
+                        max_change: float | None=SHADOW_MAX_5M_CHANGE_PCT) -> list[str]:
+    """Reasons for age-study entry rejection; does not alter other strategies.
 
-    For age <5 minutes the vendor's 'm5' window is PARTIAL history; we label
-    these entries as such and never pretend a complete 5-minute sample exists.
+    A None 5m volume minimum (micro_0_60 only) also disables the
+    surge-volume gate, but retains m5 price movement and 5m buys/sells.
     """
-    vol = pair.get('volume') or {}
-    tx = (pair.get('txns') or {}).get('m5') or {}
-    change = pair.get('priceChange') or {}
-    if not all((isinstance(d,dict) for d in (vol,tx,change))): return False
-    if ('m5' not in vol or 'buys' not in tx or 'sells' not in tx or 'm5' not in change): return False
-    if not math.isfinite(e['change5']): return False
-    if (e['cap'] < min_cap or e['v5'] < SHADOW_MIN_5M_VOLUME_USD or
-        e['buys'] < SHADOW_MIN_5M_BUYS or e['sells'] < SHADOW_MIN_5M_SELLS or
-        e['buys']/e['sells'] < SHADOW_MIN_BUY_SELL_RATIO or
-        (e['change5'] < SHADOW_MIN_5M_CHANGE_PCT or (max_change is not None and e['change5'] > max_change))): return False
-    if e['change5'] >= surge_change and e['v5'] < surge_volume: return False
-    return True
+    vol=pair.get('volume') or {}
+    tx=(pair.get('txns') or {}).get('m5') or {}
+    change=pair.get('priceChange') or {}
+    if not all(isinstance(d,dict) for d in (vol,tx,change)):
+        return ['invalid_m5_market_data']
+    reasons=[]
+    if min_volume5_usd is not None and 'm5' not in vol:
+        reasons.append('missing_volume5')
+    if 'buys' not in tx or 'sells' not in tx:
+        reasons.append('missing_transactions5')
+    if 'm5' not in change or not math.isfinite(e['change5']):
+        reasons.append('missing_price_change5')
+    if e['cap']<min_cap:reasons.append('market_cap_below_floor')
+    if min_volume5_usd is not None and e['v5']<min_volume5_usd:
+        reasons.append('volume5_below_floor')
+    if e['buys']<SHADOW_MIN_5M_BUYS:reasons.append('buys5_below_floor')
+    if e['sells']<SHADOW_MIN_5M_SELLS:reasons.append('sells5_below_floor')
+    if e['sells']>0 and e['buys']/e['sells']<SHADOW_MIN_BUY_SELL_RATIO:
+        reasons.append('buy_sell_ratio_below_floor')
+    if math.isfinite(e['change5']):
+        if e['change5']<SHADOW_MIN_5M_CHANGE_PCT:
+            reasons.append('price_change5_below_floor')
+        if max_change is not None and e['change5']>max_change:
+            reasons.append('price_change5_above_ceiling')
+        if (min_volume5_usd is not None and
+                e['change5']>=surge_change and e['v5']<surge_volume):
+            reasons.append('thin_volume_surge')
+    return reasons
+
+
+def valid_flow(pair: dict, e: dict, *, surge_change: float=13.5,
+               surge_volume: float=2500., min_cap: float=SHADOW_MIN_CAP_USD,
+               max_change: float | None=SHADOW_MAX_5M_CHANGE_PCT,
+               min_volume5_usd: float | None=SHADOW_MIN_5M_VOLUME_USD) -> bool:
+    return not flow_filter_reasons(pair,e,surge_change=surge_change,
+        surge_volume=surge_volume,min_cap=min_cap,max_change=max_change,
+        min_volume5_usd=min_volume5_usd)
 
 
 class AgeTrack:
@@ -57,6 +84,7 @@ class AgeTrack:
                  take_profit_enabled: bool=True,
                  min_entry_market_cap_usd: float=SHADOW_MIN_CAP_USD,
                  min_entry_liquidity_usd: float=15000.,
+                 min_entry_volume5_usd: float | None=SHADOW_MIN_5M_VOLUME_USD,
                  max_entry_change5_pct: float | None=SHADOW_MAX_5M_CHANGE_PCT,
                  research_risk_gate=None,
                  research_quote_probe=None):
@@ -79,6 +107,8 @@ class AgeTrack:
         self.take_profit_enabled=bool(take_profit_enabled)
         self.min_entry_market_cap_usd=float(min_entry_market_cap_usd)
         self.min_entry_liquidity_usd=float(min_entry_liquidity_usd)
+        self.min_entry_volume5_usd=(None if min_entry_volume5_usd is None
+                                    else float(min_entry_volume5_usd))
         self.max_entry_change5_pct=max_entry_change5_pct
         if not (math.isfinite(self.min_entry_market_cap_usd) and self.min_entry_market_cap_usd>0 and
                 math.isfinite(self.min_entry_liquidity_usd) and self.min_entry_liquidity_usd>0):
@@ -86,6 +116,11 @@ class AgeTrack:
         self.research_risk_gate=research_risk_gate
         self.research_quote_probe=research_quote_probe
         self.research_rejections={}
+        self.entry_filter_rejections={}
+        self.legacy_volume_observations={}
+        # In-memory, never represents a verified route or entry approval.
+        self.pending_followups={}
+        self.retry_after={}
 
         if max_entry_market_cap_usd is not None:
             max_entry_market_cap_usd=float(max_entry_market_cap_usd)
@@ -136,6 +171,13 @@ class AgeTrack:
         self.healthy_samples=int(data.get('healthy_samples',0))
         self.open_count=int(data.get('open_count',len(self.closed)+len(self.positions)))
         self.missed_quotes=int(data.get('missed_quotes',0))
+        if self.name=='micro_0_60':
+            self.entry_filter_rejections={str(k):int(v) for k,v in
+                (data.get('entry_filter_rejections') or {}).items()
+                if isinstance(v,int) and v>=0}
+            self.legacy_volume_observations={str(k):int(v) for k,v in
+                (data.get('legacy_volume_observations') or {}).items()
+                if isinstance(v,int) and v>=0}
         if self.research_risk_gate is not None:
             self.research_rejections={str(k):int(v) for k,v in
                 (data.get('research_rejections') or {}).items()
@@ -152,7 +194,19 @@ class AgeTrack:
             if data.get('halted') or data.get('halt_reason'):
                 self.changed=True
 
-    def _research_reject(self,reason):
+    def _research_reject(self,reason,mint=None,now=None):
+        if self.name=='micro_0_60' and mint:
+            if reason in ('research_risk:unverified_rpc_pending',
+                          'research_route:unverified_roundtrip_quote_pending'):
+                self.pending_followups[mint]=time.time() if now is None else now
+            elif reason in ('research_risk:unverified_rpc_failure',
+                            'research_route:unverified_roundtrip_quote',
+                            'research_risk:unverified_missing_mint_account'):
+                self.pending_followups.pop(mint,None)
+                self.retry_after[mint]=(time.time() if now is None else now)+15
+            else:
+                self.pending_followups.pop(mint,None)
+                self.retry_after.pop(mint,None)
         self.research_rejections[reason]=self.research_rejections.get(reason,0)+1
         self.changed=True
         return reason
@@ -252,20 +306,51 @@ class AgeTrack:
         if mint in self.seen:return 'already_seen'
         if self.halts_enabled and self.halted:return 'track_safety_halt'
         if len(self.positions)>=self.max_positions or self.cash<self.size:return 'capacity'
-        if not valid_flow(pair,e,surge_change=surge_change,surge_volume=surge_volume,
-                          min_cap=self.min_entry_market_cap_usd,
-                          max_change=self.max_entry_change5_pct):return 'entry_filters'
+        if self.name=='micro_0_60':
+            # Original five-minute volume cutoff is informative ONLY; never
+            # an entry rejection for this micro research track.
+            raw_volume=pair.get('volume') or {}
+            if 'm5' not in raw_volume:
+                volume_reason='original_volume5_missing_would_block'
+            elif e['v5']<SHADOW_MIN_5M_VOLUME_USD:
+                volume_reason='original_volume5_below_1400_would_block'
+            elif e['change5']>=surge_change and e['v5']<surge_volume:
+                volume_reason='original_thin_volume_surge_would_block'
+            else:
+                volume_reason=None
+            if volume_reason:
+                self.legacy_volume_observations[volume_reason]=(self.legacy_volume_observations.get(volume_reason,0)+1)
+                self.changed=True
+        filter_reasons=flow_filter_reasons(pair,e,surge_change=surge_change,
+            surge_volume=surge_volume,min_cap=self.min_entry_market_cap_usd,
+            max_change=self.max_entry_change5_pct,
+            min_volume5_usd=self.min_entry_volume5_usd)
+        if filter_reasons:
+            if self.name=='micro_0_60':
+                for reason in filter_reasons:
+                    self.entry_filter_rejections[reason]=self.entry_filter_rejections.get(reason,0)+1
+                self.changed=True
+            self.pending_followups.pop(mint,None)
+            return 'entry_filters'
         if self.research_risk_gate is not None:
-            safe,reason,details=self.research_risk_gate.allow(pair,e,stamp)
-            if not safe: return self._research_reject('research_risk:'+reason)
+            if self.name=='micro_0_60' and hasattr(self.research_risk_gate,'allow_micro'):
+                safe,reason,details=self.research_risk_gate.allow_micro(
+                    pair,e,stamp,min_cap_usd=self.min_entry_market_cap_usd)
+            else:
+                safe,reason,details=self.research_risk_gate.allow(pair,e,stamp)
+            if not safe: return self._research_reject('research_risk:'+reason,mint,stamp)
         else:
             details={}
         if self.research_quote_probe is not None:
-            route=self.research_quote_probe.probe_roundtrip(
-                mint,self.size,details.get('decimals'),pair,now=stamp)
+            quote_probe=(self.research_quote_probe.probe_micro_roundtrip
+                if self.name=='micro_0_60' and hasattr(self.research_quote_probe,'probe_micro_roundtrip')
+                else self.research_quote_probe.probe_roundtrip)
+            route=quote_probe(mint,self.size,details.get('decimals'),pair,now=stamp)
             if route.get('status')!='two_sided_jupiter_quotes_not_fills':
-                return self._research_reject('research_route:'+str(route.get('status')))
+                return self._research_reject('research_route:'+str(route.get('status')),mint,stamp)
             details=dict(details,entry_route_quote=route)
+        self.pending_followups.pop(mint,None)
+        self.retry_after.pop(mint,None)
         self.positions[mint]={'pool':e['pool'],'symbol':str((pair.get('baseToken') or {}).get('symbol',''))[:30],
             'entry_price':e['price'],'entry_age_minutes':round(e['age'],3),
             'entry_5m_partial':e['age']<5.,'opened_at':stamp,
@@ -311,6 +396,9 @@ class AgeTrack:
                 'entry_min_liquidity_usd':self.min_entry_liquidity_usd,
                 'max_change5_pct':self.max_entry_change5_pct,
                 'research_rejections':dict(self.research_rejections),
+                'entry_filter_rejections':dict(self.entry_filter_rejections),
+                'legacy_volume_observations':dict(self.legacy_volume_observations),
+                'entry_min_volume5_usd':self.min_entry_volume5_usd,
                 'exit_on_profitable_reversal':self.exit_on_profitable_reversal}
 
     def save(self):
@@ -324,6 +412,9 @@ class AgeTrack:
                  'historical_halt_reason':self.historical_halt_reason}
         if self.research_risk_gate is not None:
             payload['research_rejections']=dict(self.research_rejections)
+        if self.name=='micro_0_60':
+            payload['entry_filter_rejections']=dict(self.entry_filter_rejections)
+            payload['legacy_volume_observations']=dict(self.legacy_volume_observations)
         self.path.parent.mkdir(parents=True,exist_ok=True)
         temp=self.path.with_suffix('.tmp')
         temp.write_text(json.dumps(payload,separators=(',',':')),encoding='utf8')
@@ -353,7 +444,7 @@ class BackgroundAgeStudy:
             # historical 0_60 and 5_60 ledgers or their eligibility settings.
             for name,cap,liquidity,change_max in (
                     ('adaptive_0_60',35000.,15000.,16.),
-                    ('micro_0_60',5000.,1000.,None)):
+                    ('micro_0_60',3000.,1000.,None)):
                 self.tracks.append(AgeTrack(name=name,min_age=0.,
                     path=base.with_name(f'age_study_{name}_{base.stem}.json'),
                     starting_capital=starting_capital,halts_enabled=False,
@@ -361,11 +452,13 @@ class BackgroundAgeStudy:
                     max_entry_market_cap_usd=max_entry_market_cap_usd,
                     min_entry_market_cap_usd=cap,
                     min_entry_liquidity_usd=liquidity,
+                    min_entry_volume5_usd=(None if name=='micro_0_60' else SHADOW_MIN_5M_VOLUME_USD),
                     max_entry_change5_pct=change_max,
                     research_risk_gate=research_guard,
                     research_quote_probe=research_quote_probe))
         self.research_guard=research_guard if enable_v893_research else None
-        self.hints={};self.last_lookup={};self.max_candidates=max_candidates
+        self.hints={};self.last_lookup={};self.micro_last_lookup={}
+        self.max_candidates=max_candidates
         self.observation_counts={};self.last_stats_at=0.
 
     def hint(self,mint:str,born:float,*,now:float|None=None):
@@ -378,7 +471,8 @@ class BackgroundAgeStudy:
                 del self.hints[key]
 
     def pair_observed(self,pair:dict,*,sol_mint:str,dexes,now:float|None=None,
-                      surge_change:float=13.5,surge_volume:float=2500.):
+                      surge_change:float=13.5,surge_volume:float=2500.,
+                      micro_only:bool=False):
         stamp=time.time() if now is None else now
         mint=(pair.get('baseToken') or {}).get('address') if isinstance(pair,dict) else None
         held=any(mint in track.positions for track in self.tracks)
@@ -392,6 +486,7 @@ class BackgroundAgeStudy:
         results={}
         valid=False
         for track in self.tracks:
+            if micro_only and track.name!='micro_0_60':continue
             result=track.observe(pair,sol_mint=sol_mint,dexes=dexes,now=stamp,
                                  surge_change=surge_change,surge_volume=surge_volume)
             if result not in ('unverified_pool','different_pool','read_only'):
@@ -399,7 +494,7 @@ class BackgroundAgeStudy:
             if result=='opened' or result.startswith('closed:'):
                 results[track.name]=result
         if valid and mint:
-            self.last_lookup[mint]=stamp
+            (self.micro_last_lookup if micro_only else self.last_lookup)[mint]=stamp
         return results
 
     def due(self,*,now:float|None=None,limit:int=4):
@@ -435,10 +530,73 @@ class BackgroundAgeStudy:
                     if m not in selected:selected.append(m)
         return selected
 
-    def missing(self,mint:str,*,now:float|None=None):
+    def micro_ready_followups(self, *, now:float|None=None, limit:int=2, exclude=()):
+        """Ready async RPC/quote callbacks get a fresh-pool retry, not a stale fill."""
         stamp=time.time() if now is None else now
-        self.last_lookup[mint]=stamp
-        for track in self.tracks:track.note_missing_quote(mint,now=stamp)
+        micro=next((t for t in self.tracks if t.name=='micro_0_60'),None)
+        if micro is None:return []
+        micro.load()
+        if micro.read_only or len(micro.positions)>=micro.max_positions or micro.cash<micro.size:
+            return []
+        ready=[]; excluded=set(exclude)
+        other_held={m for t in self.tracks if t is not micro for m in t.positions}
+        risk_pending=getattr(self.research_guard,'_pending',{}) or {}
+        quote_pending=getattr(micro.research_quote_probe,'_pending',{}) or {}
+        for mint,started in tuple(micro.pending_followups.items()):
+            born=self.hints.get(mint)
+            if (mint in excluded or mint in other_held or mint in micro.seen or born is None or
+                    not 0<=stamp-born<3600):
+                micro.pending_followups.pop(mint,None)
+                continue
+            rpc=risk_pending.get(mint)
+            quote=quote_pending.get(mint)
+            # Only completed futures are urgent; avoid hammering incomplete ones.
+            completed=(rpc is not None and rpc.done()) or (
+                quote is not None and quote[1].done())
+            due_retry=stamp>=micro.retry_after.get(mint,float('inf'))
+            last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))
+            if (completed or due_retry) and stamp-last>=3:
+                ready.append((started,mint))
+        for mint,retry_at in tuple(micro.retry_after.items()):
+            born=self.hints.get(mint)
+            if born is None or mint in micro.seen or not 0<=stamp-born<3600:
+                micro.retry_after.pop(mint,None)
+                continue
+            last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))
+            if (stamp>=retry_at and stamp-last>=3 and
+                mint not in excluded and mint not in other_held):
+                ready.append((retry_at,mint))
+        return list(dict.fromkeys(mint for _,mint in sorted(ready)))[:limit]
+
+    def micro_extra_due(self, *, now:float|None=None, limit:int=3, exclude=()):
+        """Extra micro-only queue, activated by scanner backlog in bot.py."""
+        stamp=time.time() if now is None else now
+        micro=next((t for t in self.tracks if t.name=='micro_0_60'),None)
+        if micro is None:return []
+        micro.load()
+        if micro.read_only or len(micro.positions)>=micro.max_positions or micro.cash<micro.size:
+            return []
+        excluded=set(exclude)
+        other_held={m for t in self.tracks if t is not micro for m in t.positions}
+        ready=self.micro_ready_followups(now=stamp,limit=limit,exclude=excluded)
+        excluded.update(ready)
+        fresh=[]; older=[]
+        for mint,born in self.hints.items():
+            last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))
+            if (mint in excluded or mint in other_held or mint in micro.seen or
+                    mint in micro.positions or not 0<=stamp-born<3600 or stamp-last<12):
+                continue
+            item=(last,stamp-born,mint)
+            (fresh if last==0 else older).append(item)
+        # Prioritize never-checked fresh tokens, then older due mints.
+        return ready+[m for _,_,m in sorted(fresh)+sorted(older)][:max(0,limit-len(ready))]
+
+    def missing(self,mint:str,*,now:float|None=None,micro_only:bool=False):
+        stamp=time.time() if now is None else now
+        (self.micro_last_lookup if micro_only else self.last_lookup)[mint]=stamp
+        for track in self.tracks:
+            if not micro_only or track.name=='micro_0_60':
+                track.note_missing_quote(mint,now=stamp)
 
     def save(self):
         for track in self.tracks:track.save()

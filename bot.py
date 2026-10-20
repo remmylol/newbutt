@@ -534,6 +534,7 @@ if LIVE_0_60_ENABLED:
     log.warning('LIVE PRIMARY CONFIGURED wallet=%s path=%s signer_loaded=True no_tx_sent_yet=True',
                 _broker.wallet,_live_file)
 _age_study_last_stats_at = 0.0
+_micro_fast_followup_window: list[float] = []  # max 12 extra fresh-pair queries/min
 _age_study_lock = threading.RLock()
 _age_ws = None
 _age_ws_fetch_guard = threading.Lock()
@@ -4272,9 +4273,35 @@ def run_background_age_study(*, scan_entries: bool) -> None:
     if not SHADOW_AGE_STUDY_ENABLED:
         return
     stamp=time.time()
-    if scan_entries and api_cooldown_remaining()<=0:
+    # Standard 3-study lookups stay unchanged. Under a genuine discovery
+    # backlog, add up to three MICRO-ONLY lookups; never expand other tracks.
+    # A completed async RPC/Jupiter result can also prompt a fresh-pair
+    # recheck between ordinary entry scans (bounded at 12/min globally).
+    _micro_fast_followup_window[:] = [t for t in _micro_fast_followup_window
+                                      if stamp-t<60]
+    extra_mints=set()
+    due_mints=[]
+    if api_cooldown_remaining()<=0:
         with _age_study_lock:
-            due_mints = _age_study.due(now=stamp,limit=SHADOW_AGE_STUDY_FETCH_PER_SCAN)
+            if scan_entries:
+                normal_limit=min(3,SHADOW_AGE_STUDY_FETCH_PER_SCAN)
+                due_mints=_age_study.due(now=stamp,limit=normal_limit)
+                unscanned=_fresh_batch.stats().get('unscanned',0) if V893_RESEARCH_ENABLED else 0
+                if unscanned>0:
+                    micro_extra=_age_study.micro_extra_due(now=stamp,limit=6-normal_limit,exclude=due_mints)
+                    extra_mints.update(micro_extra)
+                    due_mints.extend(micro_extra)
+                log.info('V894 MICRO LOOKUP SCHEDULER backlog_unscanned=%d normal_budget=%d micro_extra=%d '
+                         'total_selected=%d only_micro_extra=True',
+                         unscanned,normal_limit,len(extra_mints),len(due_mints))
+            elif V893_RESEARCH_ENABLED and len(_micro_fast_followup_window)<12:
+                due_mints=_age_study.micro_ready_followups(
+                    now=stamp,limit=min(2,12-len(_micro_fast_followup_window)))
+                extra_mints.update(due_mints)
+                _micro_fast_followup_window.extend(stamp for _ in due_mints)
+                if due_mints:
+                    log.info('V894 MICRO ASYNC FOLLOWUP ready=%d fresh_pool_recheck=True '
+                             'no_stale_fill=True',len(due_mints))
         for mint in due_mints:
             try:
                 current=token_pairs(mint)
@@ -4284,7 +4311,7 @@ def run_background_age_study(*, scan_entries: bool) -> None:
                 log.warning('PAPER AGE STUDY DATA UNAVAILABLE mint=%s error=%s no_virtual_exit=True',
                             mint,type(exc).__name__)
                 with _age_study_lock:
-                    _age_study.missing(mint,now=stamp)
+                    _age_study.missing(mint,now=stamp,micro_only=mint in extra_mints)
                 continue
             # Same-pool selected when held, never substitute another pool.
             has_valid=False
@@ -4299,15 +4326,18 @@ def run_background_age_study(*, scan_entries: bool) -> None:
                     e=_age_study.pair_observed(p,sol_mint=SOL_MINT,
                         dexes=active_entry_routes(),now=stamp,
                         surge_change=SHADOW_SURGE_CHANGE_5M_PCT,
-                        surge_volume=SHADOW_SURGE_MIN_5M_VOLUME_USD)
-                    if pid and _age_study.last_lookup.get(mint)==stamp:
+                        surge_volume=SHADOW_SURGE_MIN_5M_VOLUME_USD,
+                        micro_only=mint in extra_mints)
+                    lookup=( _age_study.micro_last_lookup if mint in extra_mints
+                             else _age_study.last_lookup )
+                    if pid and lookup.get(mint)==stamp:
                         has_valid=True
                 for study_track,study_event in e.items():
                     log.info('PAPER AGE STUDY EVENT track=%s event=%s mint=%s pool=%s primary_ledger_untouched=True indicative_only=True',
                              study_track,study_event,mint,pid)
             if not has_valid:
                 with _age_study_lock:
-                    _age_study.missing(mint,now=stamp)
+                    _age_study.missing(mint,now=stamp,micro_only=mint in extra_mints)
                     still_held = any(mint in t.positions for t in _age_study.tracks)
                 if still_held:
                     log.warning('PAPER AGE STUDY QUOTE MISSING mint=%s no_executable_exit_proven=True no_virtual_sale=True',mint)
@@ -4326,6 +4356,13 @@ def run_background_age_study(*, scan_entries: bool) -> None:
                          report['track'],report.get('research_rejections',{}),
                          report.get('entry_min_market_cap_usd'),report.get('entry_min_liquidity_usd'),
                          report.get('max_change5_pct'))
+                if report['track']=='micro_0_60':
+                    log.info('V894 MICRO FILTER FUNNEL rejects=%s legacy_volume_would_block=%s minimum_5m_volume_usd=%s '
+                             'minimum_change5_pct=0.8 minimum_buys5=10 minimum_sells5=1 '
+                             'minimum_buy_sell_ratio=1.25 counts_are_attempts=True',
+                             report.get('entry_filter_rejections',{}),
+                             report.get('legacy_volume_observations',{}),
+                             report.get('entry_min_volume5_usd'))
             if AGE_0_60_PRIMARY and report['track']=='0_60':
                 log.info('PRIMARY 0_60 AUDIT live_mode=%s closed=%d wins=%d open=%d cash_estimate_usd=$%.2f strategy_accounting_pnl_usd=$%.4f halt=%s halt_reason=%s',
                          LIVE_0_60_ENABLED,report['closed'],report['wins'],report['open'],report['cash_usd'],

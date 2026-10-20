@@ -181,9 +181,17 @@ class ResearchRiskGate:
             return result
         except (requests.RequestException,ValueError,KeyError,TypeError):
             return {'status':'unverified_rpc_failure'}
-    def authority(self,mint,now):
+    def authority(self,mint,now,*,retry_transient=False):
         cached=self.cache.get(mint)
-        if cached and now-cached[0]<900:return cached[1]
+        if cached:
+            # Do not cache temporary RPC/provider failures for fifteen minutes.
+            # Never retry until the brief cooldown has passed; completed
+            # futures are consumed once, and the original per-minute RPC
+            # budget remains in force.
+            transient=cached[1].get('status') in (
+                'unverified_rpc_failure','unverified_missing_mint_account')
+            ttl=15 if (transient and retry_transient) else 900
+            if 0<=now-cached[0]<ttl:return cached[1]
         pending=self._pending.get(mint)
         if pending is not None:
             if not pending.done():return {'status':'unverified_rpc_pending'}
@@ -213,8 +221,17 @@ class ResearchRiskGate:
         self.calls.append(now)
         self._pending[mint]=self._executor.submit(self._authority_lookup,mint)
         return {'status':'unverified_rpc_pending'}
-    def allow(self,pair,e,now):
-        mint=e['mint'];result=self.authority(mint,now)
+    def allow_micro(self,pair,e,now,*,min_cap_usd=3000.):
+        return self.allow(pair,e,now,min_cap_usd=min_cap_usd,require_volume5=False,
+                          micro_fast_retry=True)
+
+    def allow(self,pair,e,now,*,min_cap_usd=5000.,require_volume5=True,
+              micro_fast_retry=False):
+        mint=e['mint']
+        if micro_fast_retry:
+            result=self.authority(mint,now,retry_transient=True)
+        else:
+            result=self.authority(mint,now)
         status=result.get('status','unknown')
         if status not in VERIFIED_MINT_STATUSES:
             self.reasons[status]+=1
@@ -225,10 +242,10 @@ class ResearchRiskGate:
         if result.get('freeze_authority_active'):
             self.reasons['freeze_authority_active']+=1
             return False,'freeze_authority_active',result
-        if e['liquidity']<1000 or e['cap']<5000:
+        if e['liquidity']<1000 or e['cap']<min_cap_usd:
             self.reasons['below_experimental_floor']+=1
             return False,'below_experimental_floor',result
-        if not e.get('v5') or not e.get('buys') or not e.get('sells'):
+        if (require_volume5 and not e.get('v5')) or not e.get('buys') or not e.get('sells'):
             self.reasons['missing_two_sided_activity']+=1
             return False,'missing_two_sided_activity',result
         if e['v5']/max(e['liquidity'],1)>300:
