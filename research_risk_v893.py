@@ -16,7 +16,55 @@ from concurrent.futures import ThreadPoolExecutor
 audit_log=logging.getLogger(__name__)
 
 TOKEN_PROGRAM='TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
-TOKEN_2022='TokenzQdBNbLqP5VEhdkAS6EPFJNKvQsMBD2CvmB'
+# Official Solana Token-2022 program ID (the previous string was misspelled).
+TOKEN_2022='TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'
+# Only information-only mint extensions are accepted for PAPER research.
+# Transfer hooks, fees, delegates, non-transferable/paused states and unknown
+# extension types remain blocked. This check is NOT proof of sellability.
+TOKEN_2022_INFORMATION_ONLY_EXTENSIONS=frozenset({
+    'metadataPointer', 'tokenMetadata', 'groupPointer',
+    'groupMemberPointer', 'tokenGroup', 'tokenGroupMember',
+})
+VERIFIED_MINT_STATUSES=frozenset({'verified_standard_spl','verified_token2022_basic'})
+
+
+def _verify_token2022_mint(info):
+    """Conservatively assess a jsonParsed Token-2022 mint (paper-only)."""
+    data=info.get('data')
+    parsed=(data.get('parsed') if isinstance(data,dict) else None)
+    if not isinstance(parsed,dict) or parsed.get('type')!='mint':
+        return {'status':'unverified_mint_parse','owner_program':TOKEN_2022}
+    meta=parsed.get('info')
+    if not isinstance(meta,dict) or not isinstance(meta.get('decimals'),int) or isinstance(meta.get('decimals'),bool):
+        return {'status':'unverified_mint_parse','owner_program':TOKEN_2022}
+    # Token-2022 may have optional TLV extensions after its 82-byte base mint.
+    # Never accept a non-base-size account if the provider failed to disclose
+    # extension details; an unseen transfer hook or fee could block a sale.
+    extensions=meta.get('extensions')
+    if extensions is None:
+        try: space=int(info.get('space') or data.get('space') or 0)
+        except (TypeError,ValueError,OverflowError): space=0
+        if space!=82:
+            return {'status':'unverified_token2022_extensions_unparsed',
+                    'owner_program':TOKEN_2022, 'mint_space':space}
+        extensions=[]
+    if not isinstance(extensions,list):
+        return {'status':'unverified_token2022_extensions_unparsed','owner_program':TOKEN_2022}
+    extension_names=[]
+    for extension in extensions:
+        if not isinstance(extension,dict) or not isinstance(extension.get('extension'),str):
+            return {'status':'unverified_token2022_extensions_unparsed','owner_program':TOKEN_2022}
+        extension_names.append(extension['extension'])
+    blocked=sorted(set(extension_names)-TOKEN_2022_INFORMATION_ONLY_EXTENSIONS)
+    if blocked:
+        return {'status':'unverified_token2022_extensions',
+                'owner_program':TOKEN_2022, 'blocked_extensions':blocked}
+    return {'status':'verified_token2022_basic','owner_program':TOKEN_2022,
+            'mint_authority_active':meta.get('mintAuthority') is not None,
+            'freeze_authority_active':meta.get('freezeAuthority') is not None,
+            'decimals':meta['decimals'],
+            'information_only_extensions':sorted(set(extension_names))}
+
 
 
 def _n(x):
@@ -96,7 +144,7 @@ class ResearchRiskGate:
             info=self._rpc('getAccountInfo',[mint,{'encoding':'jsonParsed','commitment':'confirmed'}]).get('value')
             if not isinstance(info,dict):result={'status':'unverified_missing_mint_account'}
             elif info.get('owner')==TOKEN_2022:
-                result={'status':'unverified_token2022_extensions'}
+                result=_verify_token2022_mint(info)
             elif info.get('owner')!=TOKEN_PROGRAM:
                 # A non-standard owner is NOT an SPL mint. Do not guess or
                 # treat it as safe; expose the public owner program so an
@@ -117,7 +165,7 @@ class ResearchRiskGate:
                             'mint_authority_active':meta.get('mintAuthority') is not None,
                             'freeze_authority_active':meta.get('freezeAuthority') is not None,
                             'decimals':meta['decimals']}
-            if result.get('status')=='verified_standard_spl':
+            if result.get('status') in VERIFIED_MINT_STATUSES:
                 # Largest token accounts are not reliably beneficial-owner
                 # concentration, since AMM LP vaults can own many tokens.
                 # Record advisory only; never label an LP vault as a rug.
@@ -147,14 +195,15 @@ class ResearchRiskGate:
             # collected, NOT on every repeat candidate evaluation. This log
             # includes public addresses only: never the RPC URL or API key.
             status=result.get('status','unknown')
-            if status!='verified_standard_spl':
+            if status not in VERIFIED_MINT_STATUSES:
                 audit_log.warning(
                     'V893 RESEARCH RPC MINT AUDIT mint=%s status=%s '
                     'owner_program=%s parsed_type=%s account_executable=%s '
-                    'paper_entry_denied=%s',
+                    'blocked_extensions=%s paper_entry_denied=%s',
                     mint,status,result.get('owner_program','unknown'),
                     result.get('parsed_type','unknown'),
-                    result.get('account_executable','unknown'),self.strict)
+                    result.get('account_executable','unknown'),
+                    result.get('blocked_extensions','none'),self.strict)
             return result
         while self.calls and now-self.calls[0]>=60:self.calls.popleft()
         if not self.rpc_url.startswith('https://'):
@@ -167,7 +216,7 @@ class ResearchRiskGate:
     def allow(self,pair,e,now):
         mint=e['mint'];result=self.authority(mint,now)
         status=result.get('status','unknown')
-        if status!='verified_standard_spl':
+        if status not in VERIFIED_MINT_STATUSES:
             self.reasons[status]+=1
             if self.strict:return False,status,result
         if result.get('mint_authority_active'):
