@@ -356,7 +356,7 @@ class BackgroundAgeStudy:
                     ('micro_0_60',5000.,1000.,None)):
                 self.tracks.append(AgeTrack(name=name,min_age=0.,
                     path=base.with_name(f'age_study_{name}_{base.stem}.json'),
-                    starting_capital=starting_capital,halts_enabled=True,
+                    starting_capital=starting_capital,halts_enabled=False,
                     take_profit_net_pct=25.,exit_on_profitable_reversal=True,
                     max_entry_market_cap_usd=max_entry_market_cap_usd,
                     min_entry_market_cap_usd=cap,
