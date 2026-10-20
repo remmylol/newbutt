@@ -2,9 +2,9 @@
 
 Only the on-chain PumpSwap Pool layout is supported. Unknown DEX/pool,
 LP-control, holder owners or reserve history fail closed for *micro_0_60*.
-No real orders, no invented safe/locked LP status. At least 99% of
-the historical PumpSwap LP supply must be provably burned; remaining
-withdrawal control is not assumed safe and dumps can still occur.
+No real orders, no invented safe/locked LP status. Canonical migration pools are verified against Pump program PDAs. At least
+99% of historical LP must be burned in other pools; unverifiable lockers
+remain blocked. No guarantee of preventing price-collapse losses.
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import time
 
 from read_only_exit_v872 import (_rpc, b58encode, valid_pubkey, PUMP_AMM_PROGRAM,
     PUMP_POOL_DISCRIMINATOR, SOL)
+from pumpswap_pda_v901 import classify_pool
 
 log=logging.getLogger(__name__)
 
@@ -103,31 +104,54 @@ class MicroRugGuard:
         bm,qm=b58encode(raw[43:75]),b58encode(raw[75:107])
         if not ((bm,qm)==(mint,SOL) or (bm,qm)==(SOL,mint)):
             raise ValueError('pool_mint_identity_mismatch')
-        if len(raw)<235:raise ValueError('unverified_lp_mint_layout')
+        if len(raw)<211:raise ValueError('unverified_lp_mint_layout')
+        classification=classify_pool(pool,raw)
+        # Independently match the fresh snapshot's verified TOKEN vault to
+        # the same program-owned Pool account used by the LP check.
+        expected_token_vault=b58encode(raw[139:171] if bm==mint else raw[171:203])
+        if snapshot.get('base_vault')!=expected_token_vault:
+            raise ValueError('pool_snapshot_security_vault_mismatch')
         lp_mint=b58encode(raw[107:139])
         creator=b58encode(raw[11:43])
+        # `creator` is the *pool authority* on migrated pools, not the
+        # original coin developer. Newer Pool layouts store coin_creator.
+        zero_key='11111111111111111111111111111111'
+        coin_creator=b58encode(raw[211:243]) if len(raw)>=243 else zero_key
+        known_coin_creator=coin_creator!=zero_key and valid_pubkey(coin_creator)
+        # Never mislabel the Pump migration PDA as the coin's developer.
+        creator_to_screen=coin_creator if known_coin_creator else creator
         if not valid_pubkey(lp_mint) or not valid_pubkey(creator):
             raise ValueError('unverified_pool_control_address')
-        # PumpSwap Pool.lp_supply tracks minted LP *before direct burns*.
-        # A tiny still-circulating share is NOT equivalent to a locked LP.
-        # Allow only >=99% cryptographically burned; otherwise unverified.
-        total_lp_supply=int.from_bytes(raw[203:211],'little')
+        # PumpSwap Pool.lp_supply may be ZERO for an official migrated pool:
+        # burned migration LP can leave no withdrawable supply. A custom
+        # zero/zero pool NEVER inherits that exemption without canonical PDA
+        # verification and a correctly-derived LP mint. Do not trust index=0
+        # or the pool's own creator string without independent PDA derivation.
+        historical=int.from_bytes(raw[203:211],'little')
         outstanding=int(_rpc(self.rpc_url,'getTokenSupply',[
             lp_mint,{'commitment':'confirmed'}])['value']['amount'])
-        if total_lp_supply<=0 or outstanding<0 or outstanding>total_lp_supply:
+        if historical<0 or outstanding<0 or outstanding>historical:
             raise ValueError('unverified_lp_supply_consistency')
-        burned_pct=100*(1-outstanding/total_lp_supply)
-        # Integer comparison avoids rounding a borderline 98.999...% burn
-        # into a 99% pass. Do not treat unidentified LP lockers as burns.
-        if outstanding*100>total_lp_supply:
-            return {'status':'unverified_lp_withdrawal_control','pool_creator':creator,
-                    'lp_mint':lp_mint,'lp_supply_raw':outstanding,
-                    'historical_lp_supply_raw':total_lp_supply,
+        if historical==0 and classification['pool_type']!='canonical_migration':
+            log.info('V901 PUMPSWAP LP REJECT pool=%s classification=%s reason=custom_zero_supply_not_verified_migration',
+                     pool,classification['pool_type'])
+            return {'status':'unverified_lp_withdrawal_control',
+                    **classification,'pool_creator':creator,'lp_mint':lp_mint,
+                    'lp_supply_raw':outstanding,'historical_lp_supply_raw':historical,
+                    'reason':'custom_zero_supply_not_a_verified_migration'}
+        burned_pct=100*(1-outstanding/historical) if historical else 100.
+        # Burned LP is irredeemable. All *outstanding* LP is conservatively
+        # counted as withdrawable, including alleged third-party locks.
+        # Enforce <=1% outstanding using integer comparisons (no rounding).
+        if historical and outstanding*100>historical:
+            log.info('V901 PUMPSWAP LP REJECT pool=%s classification=%s burned_lp_pct=%.3f outstanding_lp_pct=%.3f reason=withdrawable_exposure',
+                     pool,classification['pool_type'],burned_pct,100*outstanding/historical)
+            return {'status':'unverified_lp_withdrawal_control',
+                    **classification,'pool_creator':creator,'lp_mint':lp_mint,
+                    'lp_supply_raw':outstanding,'historical_lp_supply_raw':historical,
                     'burned_lp_pct':round(burned_pct,3),
-                    'reason':'cannot_prove_at_least_99pct_lp_burned_or_lock_verified'}
-        # This confirms only burned shares. Unburned balances held in an
-        # alleged locker stay counted as withdrawable until a separate
-        # protocol-specific lock adapter proves the beneficiary and unlock.
+                    'withdrawable_lp_pct_upper_bound':round(100* outstanding/historical,3),
+                    'reason':'withdrawable_lp_exposure_exceeds_1pct_or_lock_unverified'}
         token_supply=int(_rpc(self.rpc_url,'getTokenSupply',[mint,{'commitment':'confirmed'}])['value']['amount'])
         if token_supply<=0:raise ValueError('unverified_mint_supply')
         top=_rpc(self.rpc_url,'getTokenLargestAccounts',[mint,{'commitment':'confirmed'}])['value']
@@ -148,20 +172,26 @@ class MicroRugGuard:
             owners[info['owner']]+=quantity
         largest=max(owners.values(),default=0)/token_supply
         top_five=sum(v for _,v in owners.most_common(5))/token_supply
-        creator_share=owners[creator]/token_supply
+        creator_share=owners[creator_to_screen]/token_supply
         if largest>=.20 or top_five>=.50 or creator_share>=.10:
-            return {'status':'concentrated_wallet_supply','pool_creator':creator,
+            return {'status':'concentrated_wallet_supply',**classification,'pool_creator':creator,
                     'largest_owner_pct':round(largest*100,2),
                     'top5_owner_pct':round(top_five*100,2),
                     'creator_wallet_pct':round(creator_share*100,2),
+                    'coin_creator_identity_available':known_coin_creator,
                     'warning':'related_wallets_not_fully_identifiable'}
+        log.info('V901 PUMPSWAP LP VERIFIED pool=%s classification=%s burned_lp_pct=%.3f outstanding_lp_pct=%.3f creator_identity_known=%s read_only=True',
+                 pool,classification['pool_type'],burned_pct,(100*outstanding/historical if historical else 0.),known_coin_creator)
         return {'status':'verified_burned_lp_and_screened_holders',
-                'pool_creator':creator,'lp_mint':lp_mint,
+                **classification,'pool_creator':creator,'lp_mint':lp_mint,
+                'lp_supply_raw':outstanding,'historical_lp_supply_raw':historical,
+                'withdrawable_lp_pct_upper_bound':round(100*outstanding/historical,3) if historical else 0.,
                 'burned_lp_pct':round(burned_pct,3),
                 'unburned_lp_pct':round(100-burned_pct,3),
                 'largest_owner_pct':round(largest*100,2),
                 'top5_owner_pct':round(top_five*100,2),
                 'creator_wallet_pct':round(creator_share*100,2),
+                'coin_creator_identity_available':known_coin_creator,
                 'warning':'not_proof_of_absent_related_wallets_or_safe_sell'}
 
     def _security_check(self,mint,pool,dex,snap):
@@ -376,7 +406,9 @@ class MicroRugGuard:
                 'pending_lp_holder_checks':sum(not f.done() for f in self._security_pending.values()),
                 'completed_lp_checks_waiting':sum(f.done() for f in self._security_pending.values()),
                 'pool_checks_per_minute_limit':self.max_pool_checks_per_minute,
-                'lock_contract_adapter':'not_supported; >=99pct proven_burned LP only',
+                'canonical_pool_verification':'Pump PDA+index+pool PDA+LP mint PDA',
+                'lock_contract_adapter':'unsupported lockers fail closed; >=99pct burned or verified canonical zero-LP',
+                'pool_type_counts':dict(Counter(v.get('pool_type','unclassified') for _,v in self._security_cache.values())),
                 'fresh_snapshot_cache_size':len(self._snapshot_cache),
                 'prefetch_attempts':self.prefetch_attempts,
                 'prefetch_submitted':self.prefetch_submitted,
