@@ -7,10 +7,13 @@ vaults can be large holders and their identities need independent verification.
 from __future__ import annotations
 import collections
 import json
+import logging
 import math
 import time
 import requests
 from concurrent.futures import ThreadPoolExecutor
+
+audit_log=logging.getLogger(__name__)
 
 TOKEN_PROGRAM='TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'
 TOKEN_2022='TokenzQdBNbLqP5VEhdkAS6EPFJNKvQsMBD2CvmB'
@@ -95,7 +98,15 @@ class ResearchRiskGate:
             elif info.get('owner')==TOKEN_2022:
                 result={'status':'unverified_token2022_extensions'}
             elif info.get('owner')!=TOKEN_PROGRAM:
-                result={'status':'unverified_nonstandard_mint_owner'}
+                # A non-standard owner is NOT an SPL mint. Do not guess or
+                # treat it as safe; expose the public owner program so an
+                # operator can distinguish a genuine incompatible mint from
+                # a discovery/provider identity mismatch.
+                parsed_data=(info.get('data') or {}).get('parsed') or {}
+                result={'status':'unverified_nonstandard_mint_owner',
+                        'owner_program':str(info.get('owner') or '')[:64],
+                        'parsed_type':str(parsed_data.get('type') or '')[:40],
+                        'account_executable':bool(info.get('executable',False))}
             else:
                 parsed=(info.get('data') or {}).get('parsed') or {}
                 meta=parsed.get('info') or {}
@@ -132,6 +143,18 @@ class ResearchRiskGate:
             try: result=pending.result()
             except Exception:result={'status':'unverified_rpc_failure'}
             self.cache[mint]=(now,result)
+            # Emit this once when the completed asynchronous RPC response is
+            # collected, NOT on every repeat candidate evaluation. This log
+            # includes public addresses only: never the RPC URL or API key.
+            status=result.get('status','unknown')
+            if status!='verified_standard_spl':
+                audit_log.warning(
+                    'V893 RESEARCH RPC MINT AUDIT mint=%s status=%s '
+                    'owner_program=%s parsed_type=%s account_executable=%s '
+                    'paper_entry_denied=%s',
+                    mint,status,result.get('owner_program','unknown'),
+                    result.get('parsed_type','unknown'),
+                    result.get('account_executable','unknown'),self.strict)
             return result
         while self.calls and now-self.calls[0]>=60:self.calls.popleft()
         if not self.rpc_url.startswith('https://'):
