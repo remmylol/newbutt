@@ -14,10 +14,18 @@ from concurrent.futures import ThreadPoolExecutor
 SOL_MINT='So11111111111111111111111111111111111111112'
 class QuoteObserver:
     def __init__(self,api_key='',*,max_calls_per_minute=3):
-        self.api_key=api_key.strip();self.max_calls_per_minute=max_calls_per_minute
+        self.api_key=api_key.strip();self.max_calls_per_minute=max(1,int(max_calls_per_minute))
         self.calls=deque();self.entry_cache={}
         self._executor=ThreadPoolExecutor(max_workers=2,thread_name_prefix='v893_jupiter')
         self._pending={};self.totals={'attempts':0,'quoted':0,'unverified':0}
+    def entry_stats(self,now=None):
+        """Non-sensitive read-only quote-budget diagnostics for micro audits."""
+        stamp=time.time() if now is None else now
+        return {'max_roundtrips_per_minute':self.max_calls_per_minute,
+                'used_last_60s':sum(0<=stamp-t<60 for t in self.calls),
+                'pending_roundtrips':sum(not item[1].done() for item in self._pending.values()),
+                'cached_mints':len(self.entry_cache)}
+
     def _roundtrip_network(self,mint,size,amount,sol_usd):
         """Off-thread two-sided read-only quote lookup."""
         try:

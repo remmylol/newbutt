@@ -387,6 +387,19 @@ class AgeTrack:
                     self.halted=True;self.halt_reason=self.halt_reason or 'daily_virtual_loss_limit'
                 return 'closed:'+reason
             return 'observed'
+        # Prefetch on-chain security AND reserve history as soon as a
+        # plausible micro pool is seen. Starting only after mint authority and
+        # momentum verification wastes most of the 0-5 minute age window.
+        # Ages 7-8 are PREWARM-ONLY; buys remain banned until age eight.
+        if (self.name=='micro_0_60' and self.research_risk_gate is not None and
+                0<=e['age']<60. and not 5.<=e['age']<7. and
+                e['cap']>=self.min_entry_market_cap_usd and
+                e['liquidity']>=self.min_entry_liquidity_usd and
+                (self.max_entry_market_cap_usd is None or
+                 e['cap']<self.max_entry_market_cap_usd)):
+            guard=getattr(self.research_risk_gate,'micro_rug_guard',None)
+            if guard is not None and hasattr(guard,'prefetch'):
+                guard.prefetch(pair,stamp)
         if not self.entry_age_allowed(e['age']):
             if self.name=='micro_0_60' and 5.<=e['age']<8.:
                 self.entry_filter_rejections['blocked_age_5_to_8m']=self.entry_filter_rejections.get('blocked_age_5_to_8m',0)+1
@@ -708,8 +721,10 @@ class BackgroundAgeStudy:
                 continue
             item=(last,stamp-born,mint)
             (fresh if last==0 else older).append(item)
-        # Prioritize never-checked fresh tokens, then older due mints.
-        return ready+[m for _,_,m in sorted(fresh)+sorted(older)][:max(0,limit-len(ready))]
+        # Pending research callbacks first, followed by previously screened
+        # pools that need additional reserve observations, then new discovery.
+        # Dedup and never substitute a stale quote for the final entry check.
+        return ready+[m for _,_,m in sorted(older)+sorted(fresh)][:max(0,limit-len(ready))]
 
     def micro_urgent_held(self, *, now:float|None=None, limit:int=2):
         stamp=time.time() if now is None else now

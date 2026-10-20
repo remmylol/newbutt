@@ -31,6 +31,7 @@ class MicroRugGuard:
         self.history={};self.reasons=Counter();self._snapshot_cache={}
         self.max_pool_checks_per_minute=max(1,int(max_pool_checks_per_minute))
         self._checks=deque()
+        self.prefetch_attempts=0;self.prefetch_submitted=0
 
     def _snapshot(self,mint,pool,dex):
         """Normalize SOL/token by *mint identity*, not base/quote order.
@@ -171,6 +172,30 @@ class MicroRugGuard:
         except Exception as exc:
             return {'status':'unverified_pool_security','detail':type(exc).__name__}
 
+    def prefetch(self,pair,now):
+        """Warm on-chain reserve/security evidence without authorizing an entry.
+
+        This never trades. Existing negative LP/holder decisions are cached so
+        a high-volume discovery feed cannot repeatedly exhaust RPC capacity.
+        """
+        self.prefetch_attempts+=1
+        key=((pair.get('baseToken') or {}).get('address'),pair.get('pairAddress'))
+        if key in self._security_cache:
+            seen,verdict=self._security_cache[key]
+            status=verdict.get('status')
+            # A provider failure is not a 3-minute determination that a pool
+            # is unsafe. Retry transient RPC failures sooner; persistent LP
+            # withdrawal-control and holder concentration blocks last longer.
+            block_ttl=180 if status in (
+                'unverified_lp_withdrawal_control','concentrated_wallet_supply') else 20
+            if (0<=now-seen<block_ttl and
+                    status!='verified_burned_lp_and_screened_holders'):
+                return False,verdict.get('status','unverified_lp_or_holder_security'),{}
+        before=len(self._checks)
+        result=self.check(pair,now)
+        if len(self._checks)>before:self.prefetch_submitted+=1
+        return result
+
     def check(self,pair,now):
         mint=(pair.get('baseToken') or {}).get('address')
         pool=pair.get('pairAddress');dex=pair.get('dexId')
@@ -187,6 +212,12 @@ class MicroRugGuard:
                 self.reasons[why]+=1
                 return False,why,result
             self._snapshot_cache[key]=(now,result['snapshot'])
+            if len(self._snapshot_cache)>1600:
+                for old_key,_ in sorted(self._snapshot_cache.items(),key=lambda item:item[1][0])[:200]:
+                    self._snapshot_cache.pop(old_key,None)
+                    self.history.pop(old_key,None)
+                    self._security_cache.pop(old_key,None)
+                    self._last.pop(old_key,None)
         cached=self._snapshot_cache.get(key)
         # Consume completed results immediately and use a fresh snapshot for
         # LP checks instead of re-queueing an RPC request each observation.
@@ -208,22 +239,15 @@ class MicroRugGuard:
         hist=self.history.setdefault(key,deque(maxlen=32))
         if not hist or snapshot_time-hist[-1][0]>=5:
             hist.append((snapshot_time,int(snap['sol_vault_raw']),int(snap['token_vault_raw'])))
-        prior=[row for row in hist if 60<=snapshot_time-row[0]<=130]
-        if not prior:
-            self.reasons['unverified_60s_reserve_history']+=1
-            return False,'unverified_60s_reserve_history',{'snapshot':snap}
-        older=max(prior,key=lambda row:row[0])
-        decline=1.-int(snap['sol_vault_raw'])/max(1,older[1])
-        result={'snapshot':snap,'status':'snapshot_ok',
-                'sol_reserve_decline_pct':round(100*decline,3)}
-        if decline>=.10:
-            log.warning('MICRO RUG SOL VAULT DECLINE mint=%s pool=%s decline_pct=%.2f warning_at_10pct=True',
-                        mint,pool,100*decline)
-        if decline>=.20:
-            self.reasons['verified_sol_reserve_decline_20pct']+=1
-            return False,'verified_sol_reserve_decline_20pct',result
+        # Run LP/holder checks as soon as the first independently verified
+        # snapshot exists; never serialize them BEHIND the 60-second history
+        # wait. A completed verdict is reused while the reserve path matures.
+        result={'snapshot':snap,'status':'snapshot_ok'}
         cache=self._security_cache.get(key)
-        if cache and 0<=now-cache[0]<60:
+        if cache and 0<=now-cache[0]<(120 if cache[1].get('status')=='verified_burned_lp_and_screened_holders'
+                                  else 180 if cache[1].get('status') in (
+                                      'unverified_lp_withdrawal_control','concentrated_wallet_supply')
+                                  else 20):
             security=cache[1]
         else:
             fut=self._security_pending.get(key)
@@ -240,6 +264,19 @@ class MicroRugGuard:
         if status!='verified_burned_lp_and_screened_holders':
             self.reasons[status or 'unverified_lp_or_holder_security']+=1
             return False,status or 'unverified_lp_or_holder_security',result
+        prior=[row for row in hist if 60<=snapshot_time-row[0]<=130]
+        if not prior:
+            self.reasons['unverified_60s_reserve_history']+=1
+            return False,'unverified_60s_reserve_history',result
+        older=max(prior,key=lambda row:row[0])
+        decline=1.-int(snap['sol_vault_raw'])/max(1,older[1])
+        result['sol_reserve_decline_pct']=round(100*decline,3)
+        if decline>=.10:
+            log.warning('MICRO RUG SOL VAULT DECLINE mint=%s pool=%s decline_pct=%.2f warning_at_10pct=True',
+                        mint,pool,100*decline)
+        if decline>=.20:
+            self.reasons['verified_sol_reserve_decline_20pct']+=1
+            return False,'verified_sol_reserve_decline_20pct',result
         return True,'verified_micro_rug_evidence_not_rug_proof',result
 
     def completed(self,mint):
@@ -252,4 +289,7 @@ class MicroRugGuard:
                 'pending_lp_holder_checks':len(self._security_pending),
                 'pool_checks_per_minute_limit':self.max_pool_checks_per_minute,
                 'lock_contract_adapter':'not_supported; >=99pct proven_burned LP only',
-                'fresh_snapshot_cache_size':len(self._snapshot_cache)}
+                'fresh_snapshot_cache_size':len(self._snapshot_cache),
+                'prefetch_attempts':self.prefetch_attempts,
+                'prefetch_submitted':self.prefetch_submitted,
+                'security_results_cached':len(self._security_cache)}

@@ -491,11 +491,16 @@ _quality_ledger = CandidateQualityLedger(STATE_FILE.with_name("candidate_quality
 _fresh_batch = FreshBatchQueue(STATE_FILE.with_name("fresh_batch_state.json"))
 _candidate_pipeline = CandidatePipeline(STATE_FILE.with_name("candidate_pipeline_v74_state.json"))
 _early_shadow_v80 = EarlyShadow(STATE_FILE.with_name("early_shadow_v80_state.json"))
-_micro_v895_rug = MicroRugGuard(SOLANA_RPC_URL,max_pool_checks_per_minute=24) if V893_RESEARCH_ENABLED else None
+# v8.9.7: only throughput budgets change here; mint/LP/holder entry
+# authorization still fails closed. Provider-specific limits are configurable.
+_micro_v895_rug = MicroRugGuard(SOLANA_RPC_URL,
+    max_pool_checks_per_minute=max(1,min(60,int(os.getenv('MICRO_POOL_CHECKS_PER_MINUTE','24'))))) if V893_RESEARCH_ENABLED else None
 _v893_risk = ResearchRiskGate(rpc_url=SOLANA_RPC_URL,
     strict=os.getenv('SHADOW_V893_REQUIRE_RPC_RISK','true').lower()=='true',
-    max_rpc_per_minute=4,micro_rug_guard=_micro_v895_rug) if V893_RESEARCH_ENABLED else None
-_v893_quotes = QuoteObserver(api_key=JUPITER_API_KEY) if V893_RESEARCH_ENABLED else None
+    max_rpc_per_minute=max(1,min(30,int(os.getenv('RESEARCH_MINT_CHECKS_PER_MINUTE','12')))),
+    micro_rug_guard=_micro_v895_rug) if V893_RESEARCH_ENABLED else None
+_v893_quotes = QuoteObserver(api_key=JUPITER_API_KEY,
+    max_calls_per_minute=max(1,min(30,int(os.getenv('RESEARCH_JUPITER_ROUNDTRIPS_PER_MINUTE','10'))))) if V893_RESEARCH_ENABLED else None
 _v893_last_audit_at = 0.0
 _age_study = BackgroundAgeStudy(state_file=STATE_FILE, starting_capital=STARTING_CAPITAL,
     promoted_0_60_no_halts=AGE_0_60_PRIMARY,
@@ -4289,12 +4294,15 @@ def run_background_age_study(*, scan_entries: bool) -> None:
                 normal_limit=min(3,SHADOW_AGE_STUDY_FETCH_PER_SCAN)
                 due_mints=_age_study.due(now=stamp,limit=normal_limit)
                 unscanned=_fresh_batch.stats().get('unscanned',0) if V893_RESEARCH_ENABLED else 0
-                if unscanned>0:
+                # A quiet discovery backlog must NOT disable micro-only
+                # verification followups. Fill spare lookup slots with ready
+                # candidates regardless of batch-discovery queue depth.
+                if V893_RESEARCH_ENABLED and normal_limit<6:
                     micro_extra=_age_study.micro_extra_due(now=stamp,limit=6-normal_limit,exclude=due_mints)
                     extra_mints.update(micro_extra)
                     due_mints.extend(micro_extra)
-                log.info('V894 MICRO LOOKUP SCHEDULER backlog_unscanned=%d normal_budget=%d micro_extra=%d '
-                         'total_selected=%d only_micro_extra=True',
+                log.info('V897 MICRO LOOKUP SCHEDULER backlog_unscanned=%d normal_budget=%d micro_extra=%d '
+                         'total_selected=%d extra_even_without_discovery_backlog=True',
                          unscanned,normal_limit,len(extra_mints),len(due_mints))
             elif V893_RESEARCH_ENABLED and len(_micro_fast_followup_window)<12:
                 allowance=min(2,12-len(_micro_fast_followup_window))
@@ -4373,6 +4381,12 @@ def run_background_age_study(*, scan_entries: bool) -> None:
                              'old_micro_history_untouched=True',
                              next(t.path for t in _age_study.tracks if t.name=='micro_0_60'),
                              _age_study.micro_run_id,report['open'],report['closed'],report['cash_usd'])
+                    log.info('V897 MICRO THROUGHPUT AUDIT mint_rpc_checks_max_per_min=%d '
+                             'mint_rpc_pending=%d jupiter_entry=%s pool_guard_prefetch=%s '
+                             'age_entry_rules_preserved=True micro_run_id=%s',
+                             _v893_risk.max_rpc_per_minute,len(_v893_risk._pending),
+                             _v893_quotes.entry_stats(),(_micro_v895_rug.stats() if _micro_v895_rug else None),
+                             _age_study.micro_run_id)
                     log.info('V895 MICRO FILTER FUNNEL rejects=%s legacy_volume_would_block=%s minimum_5m_volume_usd=%s '
                              'minimum_change5_pct=0.8 minimum_buys5=10 minimum_sells5=1 '
                              'minimum_buy_sell_ratio=1.25 counts_are_attempts=True',
