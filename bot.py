@@ -4413,12 +4413,30 @@ def run_background_age_study(*, scan_entries: bool) -> None:
                     log.info('V900 MICRO UNIQUE ENTRY FUNNEL %s micro_run_id=%s '
                              'counts_are_unique_pools_since_restart_not_attempts=True',
                              report.get('micro_unique_funnel',{}),_age_study.micro_run_id)
-                    log.info('V895 MICRO FILTER FUNNEL rejects=%s legacy_volume_would_block=%s minimum_5m_volume_usd=%s '
-                             'minimum_change5_pct=0.8 minimum_buys5=10 minimum_sells5=1 '
-                             'minimum_buy_sell_ratio=1.25 counts_are_attempts=True',
+                    log.info('V905 MICRO OPPORTUNITY PROFILE min_change5_pct=%.2f '
+                             'min_buys5=%d min_sells5=%d min_buy_sell_ratio=%.2f '
+                             'min_cap_usd=%.0f min_pool_liq_usd=%.0f '
+                             'eligible_age=0_to_under5_and_8_to_under60 '
+                             'security_and_jupiter_gates_unchanged=True '
+                             'funnel_unique_pool_stages=%s no_frequency_guarantee=True',
+                             report.get('v905_min_change5_pct',0.8),
+                             report.get('v905_min_buys5',10),
+                             report.get('v905_min_sells5',1),
+                             report.get('v905_min_buy_sell_ratio',1.25),
+                             report.get('entry_min_market_cap_usd',3000),
+                             report.get('entry_min_liquidity_usd',1000),
+                             report.get('micro_unique_funnel',{}))
+                    log.info('V895 MICRO FILTER FUNNEL rejects=%s legacy_volume_would_block=%s '
+                             'minimum_5m_volume_usd=%s minimum_change5_pct=%.2f '
+                             'minimum_buys5=%d minimum_sells5=%d '
+                             'minimum_buy_sell_ratio=%.2f counts_are_attempts=True',
                              report.get('entry_filter_rejections',{}),
                              report.get('legacy_volume_observations',{}),
-                             report.get('entry_min_volume5_usd'))
+                             report.get('entry_min_volume5_usd'),
+                             report.get('v905_min_change5_pct',0.8),
+                             report.get('v905_min_buys5',10),
+                             report.get('v905_min_sells5',1),
+                             report.get('v905_min_buy_sell_ratio',1.25))
             if AGE_0_60_PRIMARY and report['track']=='0_60':
                 log.info('PRIMARY 0_60 AUDIT live_mode=%s closed=%d wins=%d open=%d cash_estimate_usd=$%.2f strategy_accounting_pnl_usd=$%.4f halt=%s halt_reason=%s',
                          LIVE_0_60_ENABLED,report['closed'],report['wins'],report['open'],report['cash_usd'],

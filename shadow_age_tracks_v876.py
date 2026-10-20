@@ -31,7 +31,11 @@ def flow_filter_reasons(pair: dict, e: dict, *, surge_change: float=13.5,
                         surge_volume: float=2500.,
                         min_cap: float=SHADOW_MIN_CAP_USD,
                         min_volume5_usd: float | None=SHADOW_MIN_5M_VOLUME_USD,
-                        max_change: float | None=SHADOW_MAX_5M_CHANGE_PCT) -> list[str]:
+                        max_change: float | None=SHADOW_MAX_5M_CHANGE_PCT,
+                        min_buys5: int=SHADOW_MIN_5M_BUYS,
+                        min_sells5: int=SHADOW_MIN_5M_SELLS,
+                        min_buy_sell_ratio: float=SHADOW_MIN_BUY_SELL_RATIO,
+                        min_change5: float=SHADOW_MIN_5M_CHANGE_PCT) -> list[str]:
     """Reasons for age-study entry rejection; does not alter other strategies.
 
     A None 5m volume minimum (micro_0_60 only) also disables the
@@ -52,12 +56,12 @@ def flow_filter_reasons(pair: dict, e: dict, *, surge_change: float=13.5,
     if e['cap']<min_cap:reasons.append('market_cap_below_floor')
     if min_volume5_usd is not None and e['v5']<min_volume5_usd:
         reasons.append('volume5_below_floor')
-    if e['buys']<SHADOW_MIN_5M_BUYS:reasons.append('buys5_below_floor')
-    if e['sells']<SHADOW_MIN_5M_SELLS:reasons.append('sells5_below_floor')
-    if e['sells']>0 and e['buys']/e['sells']<SHADOW_MIN_BUY_SELL_RATIO:
+    if e['buys']<min_buys5:reasons.append('buys5_below_floor')
+    if e['sells']<min_sells5:reasons.append('sells5_below_floor')
+    if e['sells']>0 and e['buys']/e['sells']<min_buy_sell_ratio:
         reasons.append('buy_sell_ratio_below_floor')
     if math.isfinite(e['change5']):
-        if e['change5']<SHADOW_MIN_5M_CHANGE_PCT:
+        if e['change5']<min_change5:
             reasons.append('price_change5_below_floor')
         if max_change is not None and e['change5']>max_change:
             reasons.append('price_change5_above_ceiling')
@@ -116,6 +120,27 @@ class AgeTrack:
         self.min_entry_volume5_usd=(None if min_entry_volume5_usd is None
                                     else float(min_entry_volume5_usd))
         self.max_entry_change5_pct=max_entry_change5_pct
+        # V905: Independently tunable MICRO momentum filters. All other
+        # portfolio rules, LP withdrawal, holder, reserve and Jupiter gates
+        # remain unchanged. Values stay within tested conservative bands.
+        self.micro_momentum_profile='v905_balanced_more_candidates' if name=='micro_0_60' else 'legacy_unchanged'
+        if name=='micro_0_60':
+            def micro_num(key,default,lo,hi):
+                try:
+                    value=float(os.getenv(key,str(default)))
+                    if not math.isfinite(value):raise ValueError(key)
+                    return max(lo,min(hi,value))
+                except (ValueError,TypeError,OverflowError):
+                    return float(default)
+            self.min_buys5=int(micro_num('MICRO_MIN_BUYS5',6,3,10))
+            self.min_sells5=SHADOW_MIN_5M_SELLS
+            self.min_buy_sell_ratio=micro_num('MICRO_MIN_BUY_SELL_RATIO',1.10,1.0,1.25)
+            self.min_change5=micro_num('MICRO_MIN_CHANGE5_PCT',0.30,0.0,0.8)
+        else:
+            self.min_buys5=SHADOW_MIN_5M_BUYS
+            self.min_sells5=SHADOW_MIN_5M_SELLS
+            self.min_buy_sell_ratio=SHADOW_MIN_BUY_SELL_RATIO
+            self.min_change5=SHADOW_MIN_5M_CHANGE_PCT
         if not (math.isfinite(self.min_entry_market_cap_usd) and self.min_entry_market_cap_usd>0 and
                 math.isfinite(self.min_entry_liquidity_usd) and self.min_entry_liquidity_usd>0):
             raise ValueError('invalid_research_threshold')
@@ -592,7 +617,10 @@ class AgeTrack:
         filter_reasons=flow_filter_reasons(pair,e,surge_change=surge_change,
             surge_volume=surge_volume,min_cap=self.min_entry_market_cap_usd,
             max_change=self.max_entry_change5_pct,
-            min_volume5_usd=self.min_entry_volume5_usd)
+            min_volume5_usd=self.min_entry_volume5_usd,
+            min_buys5=self.min_buys5,min_sells5=self.min_sells5,
+            min_buy_sell_ratio=self.min_buy_sell_ratio,
+            min_change5=self.min_change5)
         if filter_reasons:
             if self.name=='micro_0_60':
                 self._micro_funnel_note(e['pool'],'momentum_filter_block',stamp)
@@ -715,6 +743,11 @@ class AgeTrack:
                 'micro_unique_funnel':self._micro_funnel_stats() if self.name=='micro_0_60' else {},
                 'legacy_volume_observations':dict(self.legacy_volume_observations),
                 'entry_min_volume5_usd':self.min_entry_volume5_usd,
+                'v905_momentum_profile':self.micro_momentum_profile,
+                'v905_min_buys5':self.min_buys5,
+                'v905_min_sells5':self.min_sells5,
+                'v905_min_buy_sell_ratio':self.min_buy_sell_ratio,
+                'v905_min_change5_pct':self.min_change5,
                 'blocked_age_band':'[5,8) minutes' if self.name=='micro_0_60' else None,
                 'micro_reentries_after8':len(self.reentered_after8),
                 'pending_micro_exits':sum(bool(v.get('pending_exit_reason')) for v in self.positions.values()) if self.name=='micro_0_60' else 0,
@@ -978,11 +1011,28 @@ class BackgroundAgeStudy:
                     verified.append(mint)
                     excluded.add(mint)
                     if len(verified)+len(ready)>=limit:break
-        # No stale quote or stale pool evidence may authorize entry.
-        candidates=ready+verified
-        for _,_,mint in sorted(older)+sorted(fresh):
+        # V905 fair lookups: ready callbacks and LP-verified candidates stay
+        # first, but when there are at least two available lookup slots,
+        # reserve ONE slot for a never-before-seen mint. Without this, the
+        # older/recheck queues can monopolize the small per-scan budget and
+        # new tokens miss the [0,5) research window entirely. Each selected
+        # mint still goes through every fresh market, security and quote gate.
+        fresh.sort()
+        # Fresh completed quotes/callbacks are genuinely time critical and
+        # must NEVER be dropped to make space for brand-new discovery.
+        candidates=ready[:limit]
+        reserve_fresh=(limit>=2 and bool(fresh) and len(candidates)<limit)
+        verified_budget=max(0,limit-len(candidates)-int(reserve_fresh))
+        candidates.extend(verified[:verified_budget])
+        if reserve_fresh:
+            new_mint=fresh.pop(0)[2]
+            if new_mint not in candidates:
+                candidates.append(new_mint)
+        # Reoffer unselected verified candidates in a later cycle (they are
+        # not permanently removed from the external guard's verified set).
+        for _,_,mint in sorted(older)+fresh:
             if len(candidates)>=limit:break
-            if mint not in excluded:candidates.append(mint)
+            if mint not in excluded and mint not in candidates:candidates.append(mint)
         return candidates[:limit]
 
     def micro_urgent_held(self, *, now:float|None=None, limit:int=2):
