@@ -39,6 +39,7 @@ from fast_liquid_recheck_v85 import short_flow_nearmiss
 from shadow_pool_discovery_v861 import early_pool_hints
 from shadow_age_tracks_v876 import BackgroundAgeStudy
 from research_risk_v893 import ResearchRiskGate
+from micro_rug_guard_v895 import MicroRugGuard
 from quote_observer_v893 import QuoteObserver
 from solana_age_ws_v877 import SolanaPoolWatcher, ws_url_for_rpc
 from early_watch_shadow_v80 import (threshold_watch, EarlyShadow, pool_evidence, shadow_entry_evidence,
@@ -490,9 +491,10 @@ _quality_ledger = CandidateQualityLedger(STATE_FILE.with_name("candidate_quality
 _fresh_batch = FreshBatchQueue(STATE_FILE.with_name("fresh_batch_state.json"))
 _candidate_pipeline = CandidatePipeline(STATE_FILE.with_name("candidate_pipeline_v74_state.json"))
 _early_shadow_v80 = EarlyShadow(STATE_FILE.with_name("early_shadow_v80_state.json"))
+_micro_v895_rug = MicroRugGuard(SOLANA_RPC_URL) if V893_RESEARCH_ENABLED else None
 _v893_risk = ResearchRiskGate(rpc_url=SOLANA_RPC_URL,
     strict=os.getenv('SHADOW_V893_REQUIRE_RPC_RISK','true').lower()=='true',
-    max_rpc_per_minute=4) if V893_RESEARCH_ENABLED else None
+    max_rpc_per_minute=4,micro_rug_guard=_micro_v895_rug) if V893_RESEARCH_ENABLED else None
 _v893_quotes = QuoteObserver(api_key=JUPITER_API_KEY) if V893_RESEARCH_ENABLED else None
 _v893_last_audit_at = 0.0
 _age_study = BackgroundAgeStudy(state_file=STATE_FILE, starting_capital=STARTING_CAPITAL,
@@ -4295,12 +4297,15 @@ def run_background_age_study(*, scan_entries: bool) -> None:
                          'total_selected=%d only_micro_extra=True',
                          unscanned,normal_limit,len(extra_mints),len(due_mints))
             elif V893_RESEARCH_ENABLED and len(_micro_fast_followup_window)<12:
-                due_mints=_age_study.micro_ready_followups(
-                    now=stamp,limit=min(2,12-len(_micro_fast_followup_window)))
+                allowance=min(2,12-len(_micro_fast_followup_window))
+                urgent=_age_study.micro_urgent_held(now=stamp,limit=allowance)
+                follow=_age_study.micro_ready_followups(
+                    now=stamp,limit=allowance,exclude=urgent)
+                due_mints=(urgent+follow)[:allowance]
                 extra_mints.update(due_mints)
                 _micro_fast_followup_window.extend(stamp for _ in due_mints)
                 if due_mints:
-                    log.info('V894 MICRO ASYNC FOLLOWUP ready=%d fresh_pool_recheck=True '
+                    log.info('V895 MICRO FAST RECHECK held_age5_or_pending_and_ready=%d fresh_pool_recheck=True '
                              'no_stale_fill=True',len(due_mints))
         for mint in due_mints:
             try:
@@ -4357,7 +4362,13 @@ def run_background_age_study(*, scan_entries: bool) -> None:
                          report.get('entry_min_market_cap_usd'),report.get('entry_min_liquidity_usd'),
                          report.get('max_change5_pct'))
                 if report['track']=='micro_0_60':
-                    log.info('V894 MICRO FILTER FUNNEL rejects=%s legacy_volume_would_block=%s minimum_5m_volume_usd=%s '
+                    log.info('V895 MICRO AGE+RUG AUDIT age_entry_allowed=0_to_under5_and_8_to_under60 '
+                             'age5_exit_intent=True age5_unquoted_remains_pending=True '
+                             'pending_exit_count=%d reentries_after8=%d pool_guard=%s '
+                             'no_verified_lp_or_holder_data_means_no_new_micro_entry=True',
+                             report.get('pending_micro_exits',0),report.get('micro_reentries_after8',0),
+                             (_micro_v895_rug.stats() if _micro_v895_rug else None))
+                    log.info('V895 MICRO FILTER FUNNEL rejects=%s legacy_volume_would_block=%s minimum_5m_volume_usd=%s '
                              'minimum_change5_pct=0.8 minimum_buys5=10 minimum_sells5=1 '
                              'minimum_buy_sell_ratio=1.25 counts_are_attempts=True',
                              report.get('entry_filter_rejections',{}),

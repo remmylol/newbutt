@@ -129,7 +129,7 @@ class AgeTrack:
         self.max_entry_market_cap_usd=max_entry_market_cap_usd
         self.historical_halt_reason=None
         self.cash=self.starting_capital; self.positions={};self.closed=[]
-        self.seen=set();self.healthy_samples=0;self.open_count=0
+        self.seen=set();self.reentered_after8=set();self.healthy_samples=0;self.open_count=0
         self.missed_quotes=0;self.halted=False;self.halt_reason=None;self.read_only=False;self.loaded=False;self.changed=False
         self.error=None
 
@@ -168,6 +168,16 @@ class AgeTrack:
         self.positions=positions
         self.closed=[r for r in data['closed'][-1000:] if isinstance(r,dict)]
         self.seen={m for m in data['seen'][-4000:] if isinstance(m,str) and MINT_PATTERN.fullmatch(m)}
+        if self.name=='micro_0_60':
+            self.reentered_after8={m for m in data.get('reentered_after8',[])
+                if isinstance(m,str) and MINT_PATTERN.fullmatch(m)}
+            # Recover one-time re-entry use from older ledgers when applicable.
+            self.reentered_after8.update(str(r['mint']) for r in data['closed']
+                if isinstance(r,dict) and isinstance(r.get('entry_age_minutes'),(int,float))
+                and r['entry_age_minutes']>=8 and isinstance(r.get('mint'),str))
+            self.reentered_after8.update(m for m,r in positions.items()
+                if isinstance(r.get('entry_age_minutes'),(int,float))
+                and r['entry_age_minutes']>=8)
         self.healthy_samples=int(data.get('healthy_samples',0))
         self.open_count=int(data.get('open_count',len(self.closed)+len(self.positions)))
         self.missed_quotes=int(data.get('missed_quotes',0))
@@ -194,6 +204,21 @@ class AgeTrack:
             if data.get('halted') or data.get('halt_reason'):
                 self.changed=True
 
+    def entry_age_allowed(self, age: float) -> bool:
+        """Micro 0–5 minutes and 8–60 minutes; exclude [5,8)."""
+        return self.min_age <= age < self.max_age and not (
+            self.name=='micro_0_60' and 5. <= age < 8.)
+
+    def eligible_new_mint(self, mint: str, age: float) -> bool:
+        if not self.entry_age_allowed(age) or mint in self.positions:
+            return False
+        if mint not in self.seen:
+            return True
+        return (self.name=='micro_0_60' and age>=8. and
+                mint not in self.reentered_after8 and
+                any(c.get('mint')==mint and float(c.get('entry_age_minutes',8.))<5.
+                    for c in self.closed))
+
     def _research_reject(self,reason,mint=None,now=None):
         if self.name=='micro_0_60' and mint:
             if reason in ('research_risk:unverified_rpc_pending',
@@ -201,7 +226,12 @@ class AgeTrack:
                 self.pending_followups[mint]=time.time() if now is None else now
             elif reason in ('research_risk:unverified_rpc_failure',
                             'research_route:unverified_roundtrip_quote',
-                            'research_risk:unverified_missing_mint_account'):
+                            'research_risk:unverified_missing_mint_account',
+                          'research_risk:unverified_pool_check_pending',
+                          'research_risk:unverified_pool_check_cooldown',
+                          'research_risk:unverified_pool_security_budget',
+                          'research_risk:unverified_60s_reserve_history',
+                          'research_risk:unverified_lp_security_pending'):
                 self.pending_followups.pop(mint,None)
                 self.retry_after[mint]=(time.time() if now is None else now)+15
             else:
@@ -257,15 +287,69 @@ class AgeTrack:
             rec['last_liquidity']=e['liquidity'];self.changed=True
             if self.halts_enabled and net_pct<=-50. and not self.halted:
                 self.halted=True;self.halt_reason='catastrophic_observed_virtual_loss'
+            # A micro holding opened before age five has a hard exit intent at
+            # five minutes. Never manufacture proceeds if pool or sell route
+            # data becomes unavailable. Initiate read-only quotes in advance.
+            token_age=self.positions[mint]['entry_age_minutes']+elapsed/60.
+            micro_age_exit=(self.name=='micro_0_60' and
+                rec['entry_age_minutes']<5. and token_age>=5.)
+            # Watch actual quote availability throughout the holding period,
+            # not just when a stop/age exit fires. The quote observer enforces
+            # its own bounded independent Jupiter budget (12/min).
+            if (self.name=='micro_0_60' and self.research_quote_probe is not None and
+                    hasattr(self.research_quote_probe,'probe_micro_sell')):
+                urgent_age=rec['entry_age_minutes']<5. and token_age>=4.75
+                if urgent_age:
+                    rec['age_five_exit_prearmed']=True
+                if (urgent_age or
+                        stamp-float(rec.get('last_micro_sell_quote_check_at',0))>=25 or
+                        e['liquidity']<=rec['entry_liquidity']*.90):
+                    rec['last_micro_sell_quote_check_at']=stamp
+                    probe=self.research_quote_probe.probe_micro_sell(mint,rec,pair,now=stamp)
+                    rec['held_sell_quote_status']=probe.get('status')
+                    if probe.get('status')=='pinned_pool_sell_quote_not_fill':
+                        rec['held_sell_min_usd_estimate']=probe.get('minimum_usd_out_estimate')
             stop=net_pct<=-9.
             liquidity_loss=e['liquidity'] <= rec['entry_liquidity'] * .60
-            reason=('protective_net_stop' if stop else
+            reason=('age_5m_mandatory_exit' if micro_age_exit else
+                    'protective_net_stop' if stop else
                     'liquidity_drop_40pct' if liquidity_loss else
                     f'take_profit_{self.take_profit_net_pct:g}pct' if self.take_profit_enabled and net_pct>=self.take_profit_net_pct else
                     'profitable_reversal' if profitable_reversal else
                     'expiry_45m' if elapsed>=2700 else None)
+            # Two separate confirmed snapshots showing a >20% on-chain SOL
+            # reserve drawdown prompt a proactive exit intent. USD pool
+            # liquidity is not used as a proxy for withdrawn SOL.
+            if self.name=='micro_0_60' and self.research_risk_gate is not None:
+                guard=getattr(self.research_risk_gate,'micro_rug_guard',None)
+                if guard is not None and hasattr(guard,'check'):
+                    safe,guard_reason,_=guard.check(pair,stamp)
+                    if guard_reason=='verified_sol_reserve_decline_20pct':
+                        rec['reserve_drop_checks']=int(rec.get('reserve_drop_checks',0))+1
+                    elif safe:
+                        rec['reserve_drop_checks']=0
+                    if rec.get('reserve_drop_checks',0)>=2:
+                        reason=reason or 'onchain_sol_reserve_drop_20pct'
+            reason=rec.get('pending_exit_reason') or reason
             if reason:
-                proceeds=max(0.,self.size*(1+net_pct/100))
+                quote=None
+                if self.name=='micro_0_60':
+                    if not self.research_quote_probe or not hasattr(self.research_quote_probe,'probe_micro_sell'):
+                        rec['pending_exit_reason']=reason
+                        rec['exit_quote_status']='unverified_micro_sell_probe_not_installed'
+                        self.changed=True
+                        return 'pending_exit:'+reason
+                    quote=self.research_quote_probe.probe_micro_sell(mint,rec,pair,now=stamp)
+                    if quote.get('status')!='pinned_pool_sell_quote_not_fill':
+                        rec['pending_exit_reason']=reason
+                        rec['exit_quote_status']=quote.get('status','unverified_sell_quote')
+                        self.changed=True
+                        return 'pending_exit:'+reason
+                    # Min quote out is still only an indicative estimate, not
+                    # a fill guarantee. Never use Dex spot as sale proceeds.
+                    proceeds=max(0.,float(quote['minimum_usd_out_estimate']))
+                else:
+                    proceeds=max(0.,self.size*(1+net_pct/100))
                 self.cash+=proceeds
                 closed_trade={'mint':mint,'symbol':rec.get('symbol',''),
                     'pool':rec['pool'],'opened_at':rec['opened_at'],'closed_at':stamp,
@@ -280,11 +364,16 @@ class AgeTrack:
                     'invested_usd':self.size,'proceeds_usd':round(proceeds,6),
                     'pnl_usd':round(proceeds-self.size,6),'net_pct':round(net_pct,4),
                     'observations':rec['observations'],
-                    'execution':'indicative_pinned_pool_only_not_executable'}
+                    'execution':('jupiter_pinned_pool_min_quote_paper_only_no_fill'
+                                 if self.name=='micro_0_60' else
+                                 'indicative_pinned_pool_only_not_executable')}
+                if quote is not None:
+                    closed_trade['execution_probe']=quote
+                    closed_trade['price_only_modeled_net_pct']=round(net_pct,4)
                 if reason=='profitable_reversal':
                     closed_trade['prior_peak_net_pct']=round(prior_peak_net_pct,5)
                     closed_trade['peak_to_exit_drop_pct_points']=round(prior_peak_net_pct-net_pct,5)
-                if self.research_quote_probe is not None:
+                if self.name!='micro_0_60' and self.research_quote_probe is not None:
                     closed_trade['execution_probe']=self.research_quote_probe.probe_sell(
                         mint,rec['entry_price'],price,self.size,rec.get('token_decimals'),
                         pair,now=stamp)
@@ -296,14 +385,19 @@ class AgeTrack:
                     self.halted=True;self.halt_reason=self.halt_reason or 'daily_virtual_loss_limit'
                 return 'closed:'+reason
             return 'observed'
-        if not self.min_age <= e['age'] < self.max_age:return 'outside_window'
+        if not self.entry_age_allowed(e['age']):
+            if self.name=='micro_0_60' and 5.<=e['age']<8.:
+                self.entry_filter_rejections['blocked_age_5_to_8m']=self.entry_filter_rejections.get('blocked_age_5_to_8m',0)+1
+                self.changed=True
+                return 'blocked_age_5_to_8m'
+            return 'outside_window'
         # Apply to NEW entries only; exits remain free to proceed even after a
         # cap spike, price crash, or liquidity loss. pool_evidence requires the
         # real DexScreener marketCap (no FDV-based size substitution).
         if (self.max_entry_market_cap_usd is not None and
                 e['cap'] >= self.max_entry_market_cap_usd):
             return 'market_cap_at_or_above_limit' 
-        if mint in self.seen:return 'already_seen'
+        if not self.eligible_new_mint(mint,e['age']):return 'already_seen'
         if self.halts_enabled and self.halted:return 'track_safety_halt'
         if len(self.positions)>=self.max_positions or self.cash<self.size:return 'capacity'
         if self.name=='micro_0_60':
@@ -362,7 +456,10 @@ class AgeTrack:
             'last_price':e['price'],'observed_at':stamp,'last_net_pct':-6.,
             'peak_net_pct':-6.,'observations':1,
             'research_risk_evidence':details,
+            'entry_route_quote':details.get('entry_route_quote'),
             'token_decimals':details.get('decimals')}
+        if self.name=='micro_0_60' and e['age']>=8. and mint in self.seen:
+            self.reentered_after8.add(mint)
         self.cash-=self.size;self.seen.add(mint);self.open_count+=1
         self.changed=True
         return 'opened'
@@ -371,6 +468,10 @@ class AgeTrack:
         rec=self.positions.get(mint)
         if rec is not None:
             stamp=time.time() if now is None else now
+            if (self.name=='micro_0_60' and rec.get('entry_age_minutes',60)<5. and
+                    rec['entry_age_minutes']+(stamp-rec['opened_at'])/60.>=5.):
+                rec['pending_exit_reason']='age_5m_mandatory_exit'
+                rec['exit_quote_status']='unverified_fresh_pool_unavailable'
             rec['missing_since']=rec.get('missing_since') or stamp
             rec['quote_unavailable_checks']=int(rec.get('quote_unavailable_checks',0))+1
             self.missed_quotes+=1;self.changed=True
@@ -399,6 +500,9 @@ class AgeTrack:
                 'entry_filter_rejections':dict(self.entry_filter_rejections),
                 'legacy_volume_observations':dict(self.legacy_volume_observations),
                 'entry_min_volume5_usd':self.min_entry_volume5_usd,
+                'blocked_age_band':'[5,8) minutes' if self.name=='micro_0_60' else None,
+                'micro_reentries_after8':len(self.reentered_after8),
+                'pending_micro_exits':sum(bool(v.get('pending_exit_reason')) for v in self.positions.values()) if self.name=='micro_0_60' else 0,
                 'exit_on_profitable_reversal':self.exit_on_profitable_reversal}
 
     def save(self):
@@ -415,6 +519,7 @@ class AgeTrack:
         if self.name=='micro_0_60':
             payload['entry_filter_rejections']=dict(self.entry_filter_rejections)
             payload['legacy_volume_observations']=dict(self.legacy_volume_observations)
+            payload['reentered_after8']=sorted(self.reentered_after8)
         self.path.parent.mkdir(parents=True,exist_ok=True)
         temp=self.path.with_suffix('.tmp')
         temp.write_text(json.dumps(payload,separators=(',',':')),encoding='utf8')
@@ -506,7 +611,8 @@ class BackgroundAgeStudy:
         eligible=[m for m,b in self.hints.items() if 0 <= stamp-b <3600 and
                   m not in active and stamp-self.last_lookup.get(m,0)>=
                   (12 if self.research_guard is not None else 45) and
-                  any((not track.halts_enabled or not track.halted) and m not in track.seen and len(track.positions)<track.max_positions
+                  any((not track.halts_enabled or not track.halted) and
+                      track.eligible_new_mint(m,(stamp-b)/60.) and len(track.positions)<track.max_positions
                       and track.cash>=track.size and stamp-b >= track.min_age*60
                       for track in self.tracks)]
         # Reserve opportunity for both very young and late-age pools. Reusing
@@ -542,24 +648,27 @@ class BackgroundAgeStudy:
         other_held={m for t in self.tracks if t is not micro for m in t.positions}
         risk_pending=getattr(self.research_guard,'_pending',{}) or {}
         quote_pending=getattr(micro.research_quote_probe,'_pending',{}) or {}
+        rug_guard=getattr(self.research_guard,'micro_rug_guard',None)
         for mint,started in tuple(micro.pending_followups.items()):
             born=self.hints.get(mint)
-            if (mint in excluded or mint in other_held or mint in micro.seen or born is None or
-                    not 0<=stamp-born<3600):
+            if (mint in excluded or mint in other_held or born is None or
+                    not 0<=stamp-born<3600 or
+                    not micro.eligible_new_mint(mint,(stamp-born)/60.)):
                 micro.pending_followups.pop(mint,None)
                 continue
             rpc=risk_pending.get(mint)
             quote=quote_pending.get(mint)
             # Only completed futures are urgent; avoid hammering incomplete ones.
             completed=(rpc is not None and rpc.done()) or (
-                quote is not None and quote[1].done())
+                quote is not None and quote[1].done()) or (
+                rug_guard is not None and rug_guard.completed(mint))
             due_retry=stamp>=micro.retry_after.get(mint,float('inf'))
             last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))
             if (completed or due_retry) and stamp-last>=3:
                 ready.append((started,mint))
         for mint,retry_at in tuple(micro.retry_after.items()):
             born=self.hints.get(mint)
-            if born is None or mint in micro.seen or not 0<=stamp-born<3600:
+            if born is None or not 0<=stamp-born<3600 or not micro.eligible_new_mint(mint,(stamp-born)/60.):
                 micro.retry_after.pop(mint,None)
                 continue
             last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))
@@ -583,13 +692,29 @@ class BackgroundAgeStudy:
         fresh=[]; older=[]
         for mint,born in self.hints.items():
             last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))
-            if (mint in excluded or mint in other_held or mint in micro.seen or
-                    mint in micro.positions or not 0<=stamp-born<3600 or stamp-last<12):
+            if (mint in excluded or mint in other_held or
+                    mint in micro.positions or not 0<=stamp-born<3600 or
+                    not micro.eligible_new_mint(mint,(stamp-born)/60.) or stamp-last<12):
                 continue
             item=(last,stamp-born,mint)
             (fresh if last==0 else older).append(item)
         # Prioritize never-checked fresh tokens, then older due mints.
         return ready+[m for _,_,m in sorted(fresh)+sorted(older)][:max(0,limit-len(ready))]
+
+    def micro_urgent_held(self, *, now:float|None=None, limit:int=2):
+        stamp=time.time() if now is None else now
+        micro=next((t for t in self.tracks if t.name=='micro_0_60'),None)
+        if micro is None:return []
+        micro.load()
+        pending=[]
+        for mint,rec in micro.positions.items():
+            age=float(rec.get('entry_age_minutes',60))+(stamp-float(rec['opened_at']))/60.
+            if (rec.get('pending_exit_reason') or
+                (float(rec.get('entry_age_minutes',60))<5. and age>=4.75)):
+                last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))
+                if stamp-last>=3:
+                    pending.append((last,mint))
+        return [mint for _,mint in sorted(pending)[:limit]]
 
     def missing(self,mint:str,*,now:float|None=None,micro_only:bool=False):
         stamp=time.time() if now is None else now

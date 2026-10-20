@@ -126,3 +126,78 @@ class QuoteObserver:
         except (requests.RequestException,ValueError,KeyError,TypeError,OverflowError):
             self.totals['unverified']+=1
             return {'status':'unverified_quote_unavailable'}
+
+    def _micro_sell_network(self,mint,pool,amount,sol_usd):
+        """A fresh exact-pool sell quote; never an executed or guaranteed swap."""
+        try:
+            r=requests.get('https://api.jup.ag/swap/v1/quote',params={
+                'inputMint':mint,'outputMint':SOL_MINT,'amount':str(amount),
+                'slippageBps':'150','swapMode':'ExactIn','onlyDirectRoutes':'true'},
+                headers={'x-api-key':self.api_key},timeout=3)
+            r.raise_for_status();payload=r.json()
+            route=payload.get('routePlan') or []
+            if (payload.get('inputMint')!=mint or payload.get('outputMint')!=SOL_MINT or
+                    int(payload.get('inAmount') or -1)!=amount or len(route)!=1 or
+                    (route[0].get('swapInfo') or {}).get('ammKey')!=pool or
+                    route[0].get('percent') not in (None,100)):
+                return {'status':'unverified_pinned_pool_sell_route'}
+            raw=int(payload.get('outAmount') or 0)
+            minimum=int(payload.get('otherAmountThreshold') or 0)
+            if not 0<minimum<=raw:return {'status':'unverified_minimum_sell_proceeds'}
+            impact=float(payload.get('priceImpactPct') or 'nan')
+            if not math.isfinite(impact) or impact<0 or impact>.10:
+                return {'status':'unverified_or_excessive_sell_impact'}
+            return {'status':'pinned_pool_sell_quote_not_fill',
+                    'minimum_usd_out_estimate':round(minimum/1e9*sol_usd,8),
+                    'minimum_sol_out_lamports':minimum,'quoted_sol_out_lamports':raw,
+                    'token_amount_raw':amount,'pool':pool,
+                    'price_impact_pct':impact*100,
+                    'warning':'USD_conversion_and_paper_inventory_are_estimated;not_a_fill'}
+        except (requests.RequestException,ValueError,TypeError,KeyError,OverflowError,IndexError):
+            return {'status':'unverified_sell_quote_unavailable'}
+
+    def probe_micro_sell(self,mint,rec,pair,*,now=None):
+        """Bounded nonblocking micro-only held-position exit quote polling."""
+        stamp=time.time() if now is None else now
+        pool=rec.get('pool')
+        buy=rec.get('entry_route_quote') or {}
+        amount=buy.get('buy_token_raw_out')
+        if not isinstance(amount,int) or amount<=0:
+            return {'status':'unverified_paper_entry_token_quantity'}
+        try:
+            native=float(pair.get('priceNative') or 0)
+            usd=float(pair.get('priceUsd') or 0)
+            sol_usd=usd/native if native>0 else 0.
+            if not math.isfinite(sol_usd) or not 0<sol_usd<100000:
+                raise ValueError('invalid_native_quote')
+        except (TypeError,ValueError,OverflowError,ZeroDivisionError):
+            return {'status':'unverified_sol_usd_conversion'}
+        if not self.api_key:return {'status':'unverified_no_jupiter_key'}
+        if not hasattr(self,'_micro_exit_pending'):
+            self._micro_exit_pending={};self._micro_exit_cache={}
+            self._micro_exit_calls=deque()
+        key=(mint,pool,amount)
+        fut=self._micro_exit_pending.get(key)
+        if fut is not None:
+            if not fut.done():return {'status':'unverified_sell_quote_pending'}
+            self._micro_exit_pending.pop(key,None)
+            try:result=fut.result()
+            except Exception:result={'status':'unverified_sell_quote_unavailable'}
+            self._micro_exit_cache[key]=(stamp,result)
+            return result
+        cached=self._micro_exit_cache.get(key)
+        if cached and stamp-cached[0]<3:
+            return cached[1]
+        while self._micro_exit_calls and stamp-self._micro_exit_calls[0]>=60:
+            self._micro_exit_calls.popleft()
+        # Reserve four calls/min for mandatory age-five and risk-triggered
+        # exits; routine quote monitoring cannot consume that headroom.
+        urgent=bool(rec.get('age_five_exit_prearmed') or rec.get('pending_exit_reason') or
+                    float(rec.get('last_liquidity',1e100))<=
+                    .60*float(rec.get('entry_liquidity',0)))
+        if len(self._micro_exit_calls)>=(12 if urgent else 8):
+            return {'status':'unverified_micro_sell_quote_budget'}
+        self._micro_exit_calls.append(stamp)
+        self._micro_exit_pending[key]=self._executor.submit(
+            self._micro_sell_network,mint,pool,amount,sol_usd)
+        return {'status':'unverified_sell_quote_pending'}

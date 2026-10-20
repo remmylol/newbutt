@@ -123,13 +123,14 @@ class MomentumHistory:
         return True,'observed_price_trend_pass'
 
 class ResearchRiskGate:
-    def __init__(self,rpc_url='',*,strict=True,max_rpc_per_minute=4):
+    def __init__(self,rpc_url='',*,strict=True,max_rpc_per_minute=4,micro_rug_guard=None):
         self.rpc_url=rpc_url.strip();self.strict=bool(strict)
         self.max_rpc_per_minute=max(1,int(max_rpc_per_minute))
         self.calls=collections.deque();self.cache={}
         self._executor=ThreadPoolExecutor(max_workers=2,thread_name_prefix='v893_rpc')
         self._pending={}
         self.reasons=collections.Counter();self.momentum=MomentumHistory()
+        self.micro_rug_guard=micro_rug_guard
     def observe(self,pair,now):
         self.momentum.observe(pair,now)
     def _rpc(self,method,params):
@@ -222,8 +223,16 @@ class ResearchRiskGate:
         self._pending[mint]=self._executor.submit(self._authority_lookup,mint)
         return {'status':'unverified_rpc_pending'}
     def allow_micro(self,pair,e,now,*,min_cap_usd=3000.):
-        return self.allow(pair,e,now,min_cap_usd=min_cap_usd,require_volume5=False,
-                          micro_fast_retry=True)
+        ok,reason,details=self.allow(pair,e,now,min_cap_usd=min_cap_usd,
+            require_volume5=False,micro_fast_retry=True)
+        if not ok:return ok,reason,details
+        if self.micro_rug_guard is None:
+            return False,'unverified_micro_rug_guard_not_installed',details
+        ok,reason,pool_details=self.micro_rug_guard.check(pair,now)
+        if not ok:
+            self.reasons[reason]+=1
+            return False,reason,dict(details,micro_pool_evidence=pool_details)
+        return True,'research_risk_pass',dict(details,micro_pool_evidence=pool_details)
 
     def allow(self,pair,e,now,*,min_cap_usd=5000.,require_volume5=True,
               micro_fast_retry=False):
@@ -259,5 +268,6 @@ class ResearchRiskGate:
     def summary(self):
         return {'cached_rpc_mints':len(self.cache),'denials':dict(self.reasons),
                 'momentum_rejections':dict(self.momentum.reasons),
+                'micro_rug_guard':(self.micro_rug_guard.stats() if self.micro_rug_guard else None),
                 'rpc_budget_remaining':max(0,self.max_rpc_per_minute-len(self.calls)),
                 'strict_missing_security':self.strict,'pending_rpc':len(self._pending)}
