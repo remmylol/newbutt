@@ -500,7 +500,8 @@ _v893_risk = ResearchRiskGate(rpc_url=SOLANA_RPC_URL,
     max_rpc_per_minute=max(1,min(30,int(os.getenv('RESEARCH_MINT_CHECKS_PER_MINUTE','12')))),
     micro_rug_guard=_micro_v895_rug) if V893_RESEARCH_ENABLED else None
 _v893_quotes = QuoteObserver(api_key=JUPITER_API_KEY,
-    max_calls_per_minute=max(1,min(30,int(os.getenv('RESEARCH_JUPITER_ROUNDTRIPS_PER_MINUTE','10'))))) if V893_RESEARCH_ENABLED else None
+    max_calls_per_minute=max(1,min(30,int(os.getenv('RESEARCH_JUPITER_ROUNDTRIPS_PER_MINUTE','10')))),
+    micro_join_wait_seconds=max(0.0,min(4.0,float(os.getenv('MICRO_INLINE_QUOTE_WAIT_SECONDS','3.5'))))) if V893_RESEARCH_ENABLED else None
 _v893_last_audit_at = 0.0
 _age_study = BackgroundAgeStudy(state_file=STATE_FILE, starting_capital=STARTING_CAPITAL,
     promoted_0_60_no_halts=AGE_0_60_PRIMARY,

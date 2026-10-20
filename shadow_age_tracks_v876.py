@@ -622,7 +622,9 @@ class AgeTrack:
         if self.name=='micro_0_60':
             self._micro_funnel_note(e['pool'],'research_security_passed',stamp,mint=mint,age=e['age'])
         if self.research_quote_probe is not None:
-            quote_probe=(self.research_quote_probe.probe_micro_roundtrip
+            quote_probe=(self.research_quote_probe.probe_micro_roundtrip_join
+                if self.name=='micro_0_60' and hasattr(self.research_quote_probe,'probe_micro_roundtrip_join')
+                else self.research_quote_probe.probe_micro_roundtrip
                 if self.name=='micro_0_60' and hasattr(self.research_quote_probe,'probe_micro_roundtrip')
                 else self.research_quote_probe.probe_roundtrip)
             route=quote_probe(mint,self.size,details.get('decimals'),pair,now=stamp)

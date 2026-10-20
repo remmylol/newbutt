@@ -12,12 +12,12 @@ import math
 import logging
 import time
 import requests
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 v902_log=logging.getLogger(__name__)
 SOL_MINT='So11111111111111111111111111111111111111112'
 class QuoteObserver:
-    def __init__(self,api_key='',*,max_calls_per_minute=3):
+    def __init__(self,api_key='',*,max_calls_per_minute=3,micro_join_wait_seconds=0.0):
         self.api_key=api_key.strip();self.max_calls_per_minute=max(1,int(max_calls_per_minute))
         self.calls=deque();self.entry_cache={}
         self._executor=ThreadPoolExecutor(max_workers=2,thread_name_prefix='v893_jupiter')
@@ -27,6 +27,12 @@ class QuoteObserver:
             thread_name_prefix='v898_micro_exit')
         self._pending={};self.micro_result_statuses={};self.totals={'attempts':0,'quoted':0,'unverified':0}
         self.micro_stale_completed_quotes=0;self.micro_valid_quote_reuses=0
+        # v904: bounded inline consumption only AFTER normal micro risk gates.
+        # Off by default for standalone/library callers; the paper boot opts in.
+        self.micro_join_wait_seconds=max(0.0,min(4.0,float(micro_join_wait_seconds)))
+        self.micro_inline_join_successes=0
+        self.micro_inline_join_timeouts=0
+        self.micro_inline_join_rejections=0
     def entry_stats(self,now=None):
         """Non-sensitive read-only quote-budget diagnostics for micro audits."""
         stamp=time.time() if now is None else now
@@ -37,7 +43,11 @@ class QuoteObserver:
                 'completed_micro_quote_statuses':dict(self.micro_result_statuses),
                 'cached_mints':len(self.entry_cache),
                 'v903_stale_completed_quotes':self.micro_stale_completed_quotes,
-                'v903_fresh_quote_reuses':self.micro_valid_quote_reuses}
+                'v903_fresh_quote_reuses':self.micro_valid_quote_reuses,
+                'v904_inline_join_successes':self.micro_inline_join_successes,
+                'v904_inline_join_timeouts':self.micro_inline_join_timeouts,
+                'v904_inline_join_rejections':self.micro_inline_join_rejections,
+                'v904_inline_wait_seconds':self.micro_join_wait_seconds}
 
     def _roundtrip_network(self,mint,size,amount,sol_usd):
         """Off-thread two-sided read-only quote lookup."""
@@ -161,6 +171,13 @@ class QuoteObserver:
         if (isinstance(recorded,(int,float)) and math.isfinite(recorded)
                 and start<=recorded<=stamp+0.5):
             return float(recorded)
+        if (isinstance(recorded,(int,float)) and math.isfinite(recorded)
+                and recorded<start):
+            # A claimed response older than its own request is impossible.
+            # Do not substitute the newer request start to make it fresh.
+            return float('-inf')
+        # Missing/untrusted/future worker timestamps are conservatively
+        # dated from request start; a later clock cannot refresh an old quote.
         return start
 
     def ready_micro_mints(self,*,now=None):
@@ -197,6 +214,49 @@ class QuoteObserver:
     def probe_micro_roundtrip(self,mint,size,decimals,pair,*,now=None):
         """Bounded transient quote retries for micro_0_60 only."""
         return self.probe_roundtrip(mint,size,decimals,pair,now=now,micro_fast_retry=True)
+
+    def probe_micro_roundtrip_join(self,mint,size,decimals,pair,*,now=None):
+        """Join a *new* short-lived quote while a candidate's other gates pass.
+
+        The regular entry scanner may only revisit a mint every 5-15 seconds;
+        with a seven-second TTL it repeatedly arrived after the quote expired.
+        Instead, after on-chain/market gates pass, wait at most four seconds
+        for the already submitted read-only worker and consume its result in
+        this SAME observe() invocation. This is not a transaction or bypass:
+        `probe_micro_roundtrip` still checks actual pool, quoted minimums,
+        network response age and the rate limit; failures remain fail-closed.
+        """
+        result=self.probe_micro_roundtrip(mint,size,decimals,pair,now=now)
+        if (self.micro_join_wait_seconds<=0 or
+                result.get('status')!='unverified_roundtrip_quote_pending'):
+            return result
+        pool=pair.get('pairAddress') if isinstance(pair,dict) else None
+        if not pool:return result
+        work=self._pending.get((mint,pool))
+        if work is None:return result
+        _started,future=work
+        try:
+            future.result(timeout=self.micro_join_wait_seconds)
+        except FutureTimeout:
+            self.micro_inline_join_timeouts+=1
+            return result
+        except Exception:
+            self.micro_inline_join_rejections+=1
+            return {'status':'unverified_micro_pinned_roundtrip'}
+        # Never evaluate freshness using the original scan timestamp: the
+        # worker may have finished seconds after scan time. Fetch the result
+        # through the normal quote cache/validation with wall-clock NOW.
+        completed_at=time.time()
+        confirmed=self.probe_micro_roundtrip(mint,size,decimals,pair,now=completed_at)
+        if (confirmed.get('status')=='two_sided_jupiter_quotes_not_fills'
+                and confirmed.get('pool')==pool):
+            self.micro_inline_join_successes+=1
+            v902_log.info('V904 MICRO INLINE QUOTE JOIN mint=%s pool=%s '
+                'quote_age_s=%.3f market_security_checked=True paper_only=True',
+                mint,pool,max(0.0,completed_at-float(confirmed.get('quote_observed_at',completed_at))))
+        else:
+            self.micro_inline_join_rejections+=1
+        return confirmed
 
     def probe_roundtrip(self,mint,size,decimals,pair,*,now=None,micro_fast_retry=False):
         stamp=time.time() if now is None else now
