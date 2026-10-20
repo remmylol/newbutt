@@ -26,6 +26,7 @@ class QuoteObserver:
         self._micro_exit_executor=ThreadPoolExecutor(max_workers=2,
             thread_name_prefix='v898_micro_exit')
         self._pending={};self.micro_result_statuses={};self.totals={'attempts':0,'quoted':0,'unverified':0}
+        self.micro_stale_completed_quotes=0;self.micro_valid_quote_reuses=0
     def entry_stats(self,now=None):
         """Non-sensitive read-only quote-budget diagnostics for micro audits."""
         stamp=time.time() if now is None else now
@@ -34,7 +35,9 @@ class QuoteObserver:
                 'pending_roundtrips':sum(not item[1].done() for item in self._pending.values()),
                 'ready_roundtrips':sum(item[1].done() for item in self._pending.values()),
                 'completed_micro_quote_statuses':dict(self.micro_result_statuses),
-                'cached_mints':len(self.entry_cache)}
+                'cached_mints':len(self.entry_cache),
+                'v903_stale_completed_quotes':self.micro_stale_completed_quotes,
+                'v903_fresh_quote_reuses':self.micro_valid_quote_reuses}
 
     def _roundtrip_network(self,mint,size,amount,sol_usd):
         """Off-thread two-sided read-only quote lookup."""
@@ -92,6 +95,9 @@ class QuoteObserver:
                 'slippageBps':'150','swapMode':'ExactIn','onlyDirectRoutes':'true'},
                 headers=headers,timeout=3)
             buy_response.raise_for_status();buy=buy_response.json()
+            # The BUY is the older of the two quote responses. Timestamp it
+            # here so a 7-second TTL bounds the age of BOTH directions.
+            quote_observed_at=time.time()
             if not self._pinned_direct_route(buy,SOL_MINT,mint,amount,pool):
                 return {'status':'rejected_unpinned_micro_entry_route'}
             gross_tokens=int(buy.get('outAmount') or 0)
@@ -135,7 +141,8 @@ class QuoteObserver:
                 return {'status':'rejected_unfavorable_micro_minimum_roundtrip',
                     'minimum_roundtrip_usd':round(conservative_usd,6)}
             return {'status':'two_sided_jupiter_quotes_not_fills',
-                'pool':pool,'buy_token_raw_out':gross_tokens,
+                'pool':pool,'quote_observed_at':quote_observed_at,
+                'buy_token_raw_out':gross_tokens,
                 'buy_min_token_raw_out':minimum_tokens,
                 'minimum_roundtrip_usd':round(conservative_usd,6),
                 'gross_roundtrip_return_usd':round(sol_out/1e9*sol_usd,6),
@@ -144,6 +151,48 @@ class QuoteObserver:
                 'warning':'pinned_pool_read_only_quotes;minimum_inventory_and_sale_are_estimates_not_fills'}
         except (requests.RequestException,ValueError,KeyError,TypeError,OverflowError,AttributeError):
             return {'status':'unverified_micro_pinned_roundtrip'}
+
+    @staticmethod
+    def _micro_quote_time(start,result,stamp):
+        # Untrusted/missing worker timestamps NEVER make a quote newer than
+        # the actual request start. Only a worker-issued timestamp within the
+        # request/observation interval may refine freshness.
+        recorded=result.get('quote_observed_at') if isinstance(result,dict) else None
+        if (isinstance(recorded,(int,float)) and math.isfinite(recorded)
+                and start<=recorded<=stamp+0.5):
+            return float(recorded)
+        return start
+
+    def ready_micro_mints(self,*,now=None):
+        """Hint callback scheduler about fresh, finished same-pool quotes.
+
+        Does not authorize any entry. Only the normal probe/observe path may
+        consume a quote after re-verifying the pool, mint and market gates.
+        """
+        stamp=time.time() if now is None else now
+        ready=set()
+        for key,(start,future) in tuple(self._pending.items()):
+            if not (isinstance(key,tuple) and len(key)==2 and future.done()):
+                continue
+            try:result=future.result()
+            except Exception:continue
+            observed=self._micro_quote_time(start,result,stamp)
+            if (result.get('status')=='two_sided_jupiter_quotes_not_fills'
+                    and result.get('pool')==key[1] and 0<=stamp-observed<=7):
+                ready.add(key[0])
+        for key,(observed,result) in tuple(self.entry_cache.items()):
+            if (isinstance(key,tuple) and len(key)==2 and
+                    result.get('status')=='two_sided_jupiter_quotes_not_fills'
+                    and result.get('pool')==key[1] and 0<=stamp-observed<=7):
+                ready.add(key[0])
+        return ready
+
+    def quote_inflight_or_fresh(self,mint,*,now=None):
+        stamp=time.time() if now is None else now
+        return (mint in self.ready_micro_mints(now=stamp) or
+                any(isinstance(key,tuple) and key[0]==mint and not future.done()
+                    for key,(start,future) in self._pending.items()
+                    if 0<=stamp-start<=12))
 
     def probe_micro_roundtrip(self,mint,size,decimals,pair,*,now=None):
         """Bounded transient quote retries for micro_0_60 only."""
@@ -155,11 +204,19 @@ class QuoteObserver:
         cache_key=(mint,pool) if micro_fast_retry else mint
         cached=self.entry_cache.get(cache_key)
         if cached:
-            # Recheck temporary quote-provider failures after bounded delay;
-            # successful quotes retain their original 20-second TTL.
+            # A successful micro quote may be used only within 7 seconds of
+            # the older Jupiter response, never 10 seconds of polling.
             transient=cached[1].get('status')=='unverified_roundtrip_quote'
-            ttl=(7 if transient else 10) if micro_fast_retry else 20
-            if 0<=stamp-cached[0]<ttl:return cached[1]
+            if micro_fast_retry:
+                ttl=(7 if cached[1].get('status')=='two_sided_jupiter_quotes_not_fills'
+                     else 7 if transient else 10)
+            else:
+                ttl=20
+            if 0<=stamp-cached[0]<=ttl:
+                if micro_fast_retry and cached[1].get('status')=='two_sided_jupiter_quotes_not_fills':
+                    self.micro_valid_quote_reuses+=1
+                return cached[1]
+            self.entry_cache.pop(cache_key,None)
         pending=self._pending.get(cache_key)
         if pending:
             start,future=pending
@@ -177,10 +234,20 @@ class QuoteObserver:
                         pool,mint,result.get('nominal_entry_size_usd'),
                         result.get('entry_min_inventory_spot_usd'),
                         result.get('spot_value_to_entry_ratio'))
-            if 0<=stamp-start<=(10 if micro_fast_retry else 25):
-                # Age quotes from request start, not from delayed polling.
-                self.entry_cache[cache_key]=(start,result)
+            observed=(self._micro_quote_time(start,result,stamp)
+                      if micro_fast_retry and result.get('status')=='two_sided_jupiter_quotes_not_fills'
+                      else start)
+            ttl=(7 if micro_fast_retry and result.get('status')=='two_sided_jupiter_quotes_not_fills'
+                 else 10 if micro_fast_retry else 25)
+            if 0<=stamp-observed<=ttl:
+                # Retain the older provider response time for a valid
+                # two-sided micro quote; failed quotes use request start.
+                self.entry_cache[cache_key]=(observed,result)
                 return result
+            if micro_fast_retry and result.get('status')=='two_sided_jupiter_quotes_not_fills':
+                self.micro_stale_completed_quotes+=1
+                v902_log.info('V903 MICRO EXPIRED QUOTE mint=%s pool=%s quote_age_s=%.3f '
+                    'will_requote=True no_entry_from_stale_result=True',mint,pool,stamp-observed)
         if not self.api_key:return {'status':'unverified_no_jupiter_key'}
         if not isinstance(decimals,int) or not 0<=decimals<=18:
             return {'status':'unverified_token_decimals'}

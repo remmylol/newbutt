@@ -43,6 +43,8 @@ class MicroRugGuard:
         self.callbacks_consumed_snapshot=0
         self.callbacks_consumed_lp=0
         self.transient_provider_failures=0
+        # Recently completed checks wake only the scheduler, never authorize buys.
+        self._v903_recent_completions={}
 
     def _snapshot(self,mint,pool,dex):
         """Normalize SOL/token by *mint identity*, not base/quote order.
@@ -265,6 +267,7 @@ class MicroRugGuard:
                 continue
             self._pending.pop(key,None)
             self.callbacks_consumed_snapshot+=1
+            self._v903_recent_completions[key[0]]=now
             start=self._last.get(key,now)
             try:result=task.result()
             except Exception as exc:
@@ -297,6 +300,7 @@ class MicroRugGuard:
                 continue
             self._security_pending.pop(key,None)
             self.callbacks_consumed_lp+=1
+            self._v903_recent_completions[key[0]]=now
             # LP input was a verified snapshot, so the verdict cannot be
             # considered newer than that snapshot or its RPC lookup.
             start=self._snapshot_cache.get(key,(now,))[0]
@@ -312,6 +316,13 @@ class MicroRugGuard:
             self._note_unique(key,status)
             log.info('V902 MICRO SECURITY CALLBACK pool=%s mint=%s stage=lp_holders status=%s',
                      key[1],key[0],status)
+
+    def recently_completed_mints(self,now):
+        """Short-lived scheduling hints, not security approval."""
+        for mint,completed in tuple(self._v903_recent_completions.items()):
+            if not 0<=now-completed<=12:
+                self._v903_recent_completions.pop(mint,None)
+        return set(self._v903_recent_completions)
 
     def prioritized_verified_mints(self,now):
         """Scheduling hints, never an entry authorization."""

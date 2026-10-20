@@ -272,6 +272,17 @@ class AgeTrack:
             if reason in ('research_risk:unverified_rpc_pending',
                           'research_route:unverified_roundtrip_quote_pending'):
                 self.pending_followups[mint]=time.time() if now is None else now
+            elif (reason in ('research_risk:unverified_pool_check_pending',
+                             'research_risk:unverified_pool_check_cooldown',
+                             'research_risk:unverified_lp_security_pending') and
+                  self.research_quote_probe is not None and
+                  hasattr(self.research_quote_probe,'quote_inflight_or_fresh') and
+                  self.research_quote_probe.quote_inflight_or_fresh(mint,now=now)):
+                # A completed Jupiter quote must not lose its urgent callback
+                # just because the next on-chain snapshot is still pending.
+                # This schedules a RECHECK, not a trade or stale approval.
+                self.pending_followups[mint]=time.time() if now is None else now
+                self.retry_after[mint]=(time.time() if now is None else now)+3
             elif reason in ('research_risk:unverified_rpc_failure',
                             'research_route:unverified_roundtrip_quote',
                           'research_route:unverified_micro_pinned_roundtrip',
@@ -615,6 +626,12 @@ class AgeTrack:
                 if self.name=='micro_0_60' and hasattr(self.research_quote_probe,'probe_micro_roundtrip')
                 else self.research_quote_probe.probe_roundtrip)
             route=quote_probe(mint,self.size,details.get('decimals'),pair,now=stamp)
+            # Defense in depth: a 'successful' status returned by a corrupted
+            # callback/cache cannot substitute a different unverified pool.
+            if (self.name=='micro_0_60' and
+                    route.get('status')=='two_sided_jupiter_quotes_not_fills' and
+                    route.get('pool')!=e['pool']):
+                route={'status':'rejected_unpinned_micro_entry_route'}
             if route.get('status')!='two_sided_jupiter_quotes_not_fills':
                 if self.name=='micro_0_60':
                     status=str(route.get('status'))
@@ -625,6 +642,15 @@ class AgeTrack:
                 return self._research_reject('research_route:'+str(route.get('status')),mint,stamp)
             if self.name=='micro_0_60':
                 self._micro_funnel_note(e['pool'],'jupiter_roundtrip_passed',stamp,mint=mint,age=e['age'])
+                quote_seen=route.get('quote_observed_at')
+                quote_age=(round(stamp-quote_seen,3) if isinstance(quote_seen,(int,float))
+                           and math.isfinite(quote_seen) and 0<=stamp-quote_seen<=7
+                           else 'request_start_or_mock_verified_by_probe')
+                v902_log.info('V903 MICRO ENTRY JOIN pool=%s mint=%s age_min=%.3f '
+                    'security_passed=True quote_passed=True quote_age_s=%s '
+                    'same_pool=%s age_allowed=%s entry=paper_only',
+                    e['pool'],mint,e['age'],quote_age,route.get('pool')==e['pool'],
+                    self.entry_age_allowed(e['age']))
             details=dict(details,entry_route_quote=route)
         self.pending_followups.pop(mint,None)
         self.retry_after.pop(mint,None)
@@ -847,7 +873,19 @@ class BackgroundAgeStudy:
         risk_pending=getattr(self.research_guard,'_pending',{}) or {}
         quote_pending=getattr(micro.research_quote_probe,'_pending',{}) or {}
         rug_guard=getattr(self.research_guard,'micro_rug_guard',None)
-        for mint,started in tuple(micro.pending_followups.items()):
+        quote_observer=micro.research_quote_probe
+        quote_ready=(quote_observer.ready_micro_mints(now=stamp)
+                     if quote_observer is not None and
+                     hasattr(quote_observer,'ready_micro_mints') else set())
+        pool_ready=(rug_guard.recently_completed_mints(stamp)
+                    if rug_guard is not None and
+                    hasattr(rug_guard,'recently_completed_mints') else set())
+        # Do not rely solely on pending_followups: a temporary security
+        # rejection may have removed it while the quote completed. Inspect
+        # both callback systems independently and deduplicate by mint.
+        candidates=set(micro.pending_followups)|quote_ready|pool_ready
+        for mint in candidates:
+            started=micro.pending_followups.get(mint,stamp)
             if (rug_guard is not None and
                 hasattr(rug_guard,'negative_pool_deferral_until') and
                 rug_guard.negative_pool_deferral_until(mint,stamp)):
@@ -864,17 +902,24 @@ class BackgroundAgeStudy:
             # of finished quotes until they had already expired. A completed
             # future for this mint merely SCHEDULES a retry: the entry quote
             # is still revalidated against the exact selected pool in observe.
-            quote_ready=any(
+            ready_quote=(mint in quote_ready or any(
                 (key==mint or (isinstance(key,tuple) and len(key)>=1 and key[0]==mint))
-                and pending[1].done()
-                for key,pending in quote_pending.items())
+                and pending[1].done() and 0<=stamp-pending[0]<=7
+                for key,pending in quote_pending.items()))
             # Only completed futures are urgent; avoid hammering incomplete ones.
-            completed=(rpc is not None and rpc.done()) or quote_ready or (
-                rug_guard is not None and rug_guard.completed(mint))
+            completed=(rpc is not None and rpc.done()) or ready_quote or (
+                mint in pool_ready) or (rug_guard is not None and rug_guard.completed(mint))
             due_retry=stamp>=micro.retry_after.get(mint,float('inf'))
             last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))
             if (completed or due_retry) and stamp-last>=3:
-                ready.append((started,mint))
+                # Finished two-sided quotes take priority over bare pool
+                # callbacks, but this only schedules a fresh candidate scan.
+                priority=(0 if ready_quote else 1 if mint in pool_ready else 2)
+                ready.append((priority,started,mint))
+                if priority<2:
+                    v902_log.info('V903 MICRO CALLBACK WAKE mint=%s quote_fresh=%s '
+                        'pool_callback_recent=%s next_action=fresh_pair_and_all_gates '
+                        'paper_only=True',mint,bool(ready_quote),mint in pool_ready)
         for mint,retry_at in tuple(micro.retry_after.items()):
             if (rug_guard is not None and
                 hasattr(rug_guard,'negative_pool_deferral_until') and
@@ -887,8 +932,8 @@ class BackgroundAgeStudy:
             last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))
             if (stamp>=retry_at and stamp-last>=3 and
                 mint not in excluded and mint not in other_held):
-                ready.append((retry_at,mint))
-        return list(dict.fromkeys(mint for _,mint in sorted(ready)))[:limit]
+                ready.append((2,retry_at,mint))
+        return list(dict.fromkeys(mint for _,_,mint in sorted(ready)))[:limit]
 
     def micro_extra_due(self, *, now:float|None=None, limit:int=3, exclude=()):
         """Extra micro-only queue, activated by scanner backlog in bot.py."""
