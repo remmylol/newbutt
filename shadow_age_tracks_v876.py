@@ -124,6 +124,9 @@ class AgeTrack:
         # In-memory, never represents a verified route or entry approval.
         self.pending_followups={}
         self.retry_after={}
+        # Per-process UNIQUE pool funnel; old persisted ledger is untouched.
+        # A pool may appear in several stages over time (e.g. pending -> pass).
+        self._micro_unique_funnel={}
 
         if max_entry_market_cap_usd is not None:
             max_entry_market_cap_usd=float(max_entry_market_cap_usd)
@@ -206,6 +209,27 @@ class AgeTrack:
             self.halted=False;self.halt_reason=None
             if data.get('halted') or data.get('halt_reason'):
                 self.changed=True
+
+    def _micro_funnel_note(self,pool,stage,now):
+        if self.name!='micro_0_60' or not pool:return
+        rec=self._micro_unique_funnel.setdefault(pool,{'last':now,'stages':set()})
+        rec['last']=now
+        rec['stages'].add(stage)
+        # In-memory diagnostics for *this deployment*, not a historical
+        # unique-trade metric. Bound memory without erasing persisted trades.
+        if len(self._micro_unique_funnel)>1800:
+            oldest=sorted(self._micro_unique_funnel,
+                key=lambda k:self._micro_unique_funnel[k]['last'])[:200]
+            for k in oldest:self._micro_unique_funnel.pop(k,None)
+
+    def _micro_funnel_stats(self):
+        counts={}
+        for rec in self._micro_unique_funnel.values():
+            for stage in rec['stages']:
+                counts[stage]=counts.get(stage,0)+1
+        return {'scope':'unique_pool_addresses_since_process_start',
+                'pools':len(self._micro_unique_funnel),
+                'stages_not_mutually_exclusive':counts}
 
     def entry_age_allowed(self, age: float) -> bool:
         """Micro 0–5 minutes and 8–60 minutes; exclude [5,8)."""
@@ -483,6 +507,8 @@ class AgeTrack:
                     self.halted=True;self.halt_reason=self.halt_reason or 'daily_virtual_loss_limit'
                 return 'closed:'+reason
             return 'observed'
+        if self.name=='micro_0_60':
+            self._micro_funnel_note(e['pool'],'market_pool_observed',stamp)
         # Prefetch on-chain security AND reserve history as soon as a
         # plausible micro pool is seen. Starting only after mint authority and
         # momentum verification wastes most of the 0-5 minute age window.
@@ -499,6 +525,7 @@ class AgeTrack:
         if not self.entry_age_allowed(e['age']):
             if self.name=='micro_0_60' and 5.<=e['age']<8.:
                 self.entry_filter_rejections['blocked_age_5_to_8m']=self.entry_filter_rejections.get('blocked_age_5_to_8m',0)+1
+                self._micro_funnel_note(e['pool'],'age_5_to_8_block',stamp)
                 self.changed=True
                 return 'blocked_age_5_to_8m'
             return 'outside_window'
@@ -532,27 +559,45 @@ class AgeTrack:
             min_volume5_usd=self.min_entry_volume5_usd)
         if filter_reasons:
             if self.name=='micro_0_60':
+                self._micro_funnel_note(e['pool'],'momentum_filter_block',stamp)
                 for reason in filter_reasons:
                     self.entry_filter_rejections[reason]=self.entry_filter_rejections.get(reason,0)+1
                 self.changed=True
             self.pending_followups.pop(mint,None)
             return 'entry_filters'
+        if self.name=='micro_0_60':
+            self._micro_funnel_note(e['pool'],'age_and_flow_passed',stamp)
         if self.research_risk_gate is not None:
             if self.name=='micro_0_60' and hasattr(self.research_risk_gate,'allow_micro'):
                 safe,reason,details=self.research_risk_gate.allow_micro(
                     pair,e,stamp,min_cap_usd=self.min_entry_market_cap_usd)
             else:
                 safe,reason,details=self.research_risk_gate.allow(pair,e,stamp)
-            if not safe: return self._research_reject('research_risk:'+reason,mint,stamp)
+            if not safe:
+                if self.name=='micro_0_60':
+                    pending=('pending' in str(reason) or 'budget' in str(reason) or
+                             'unverified_60s_reserve_history' in str(reason))
+                    self._micro_funnel_note(e['pool'],
+                        'research_waiting' if pending else 'research_security_blocked',stamp)
+                return self._research_reject('research_risk:'+reason,mint,stamp)
         else:
             details={}
+        if self.name=='micro_0_60':
+            self._micro_funnel_note(e['pool'],'research_security_passed',stamp)
         if self.research_quote_probe is not None:
             quote_probe=(self.research_quote_probe.probe_micro_roundtrip
                 if self.name=='micro_0_60' and hasattr(self.research_quote_probe,'probe_micro_roundtrip')
                 else self.research_quote_probe.probe_roundtrip)
             route=quote_probe(mint,self.size,details.get('decimals'),pair,now=stamp)
             if route.get('status')!='two_sided_jupiter_quotes_not_fills':
+                if self.name=='micro_0_60':
+                    status=str(route.get('status'))
+                    waiting=('pending' in status or 'budget' in status)
+                    self._micro_funnel_note(e['pool'],
+                        'jupiter_quote_waiting' if waiting else 'jupiter_quote_blocked',stamp)
                 return self._research_reject('research_route:'+str(route.get('status')),mint,stamp)
+            if self.name=='micro_0_60':
+                self._micro_funnel_note(e['pool'],'jupiter_roundtrip_passed',stamp)
             details=dict(details,entry_route_quote=route)
         self.pending_followups.pop(mint,None)
         self.retry_after.pop(mint,None)
@@ -573,6 +618,8 @@ class AgeTrack:
         if self.name=='micro_0_60' and e['age']>=8. and mint in self.seen:
             self.reentered_after8.add(mint)
         self.cash-=self.size;self.seen.add(mint);self.open_count+=1
+        if self.name=='micro_0_60':
+            self._micro_funnel_note(e['pool'],'paper_entry_opened',stamp)
         self.changed=True
         return 'opened'
 
@@ -610,6 +657,7 @@ class AgeTrack:
                 'max_change5_pct':self.max_entry_change5_pct,
                 'research_rejections':dict(self.research_rejections),
                 'entry_filter_rejections':dict(self.entry_filter_rejections),
+                'micro_unique_funnel':self._micro_funnel_stats() if self.name=='micro_0_60' else {},
                 'legacy_volume_observations':dict(self.legacy_volume_observations),
                 'entry_min_volume5_usd':self.min_entry_volume5_usd,
                 'blocked_age_band':'[5,8) minutes' if self.name=='micro_0_60' else None,
@@ -773,6 +821,10 @@ class BackgroundAgeStudy:
         quote_pending=getattr(micro.research_quote_probe,'_pending',{}) or {}
         rug_guard=getattr(self.research_guard,'micro_rug_guard',None)
         for mint,started in tuple(micro.pending_followups.items()):
+            if (rug_guard is not None and
+                hasattr(rug_guard,'negative_pool_deferral_until') and
+                rug_guard.negative_pool_deferral_until(mint,stamp)):
+                continue
             born=self.hints.get(mint)
             if (mint in excluded or mint in other_held or born is None or
                     not 0<=stamp-born<3600 or
@@ -797,6 +849,10 @@ class BackgroundAgeStudy:
             if (completed or due_retry) and stamp-last>=3:
                 ready.append((started,mint))
         for mint,retry_at in tuple(micro.retry_after.items()):
+            if (rug_guard is not None and
+                hasattr(rug_guard,'negative_pool_deferral_until') and
+                rug_guard.negative_pool_deferral_until(mint,stamp)):
+                continue
             born=self.hints.get(mint)
             if born is None or not 0<=stamp-born<3600 or not micro.eligible_new_mint(mint,(stamp-born)/60.):
                 micro.retry_after.pop(mint,None)
@@ -820,7 +876,11 @@ class BackgroundAgeStudy:
         ready=self.micro_ready_followups(now=stamp,limit=limit,exclude=excluded)
         excluded.update(ready)
         fresh=[]; older=[]
+        guard=getattr(self.research_guard,'micro_rug_guard',None)
         for mint,born in self.hints.items():
+            if (guard is not None and hasattr(guard,'negative_pool_deferral_until') and
+                guard.negative_pool_deferral_until(mint,stamp)):
+                continue
             last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))
             if (mint in excluded or mint in other_held or
                     mint in micro.positions or not 0<=stamp-born<3600 or

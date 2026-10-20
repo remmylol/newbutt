@@ -32,6 +32,11 @@ class MicroRugGuard:
         self.max_pool_checks_per_minute=max(1,int(max_pool_checks_per_minute))
         self._checks=deque()
         self.prefetch_attempts=0;self.prefetch_submitted=0
+        # In-memory telemetry: unique pools versus repeated poll attempts.
+        self._unique_statuses={};self._reported_stages={}
+        self.security_negative_cache_hits=0
+        self.completed_futures_pruned=0
+        self._last_prune=0.
 
     def _snapshot(self,mint,pool,dex):
         """Normalize SOL/token by *mint identity*, not base/quote order.
@@ -112,7 +117,9 @@ class MicroRugGuard:
         if total_lp_supply<=0 or outstanding<0 or outstanding>total_lp_supply:
             raise ValueError('unverified_lp_supply_consistency')
         burned_pct=100*(1-outstanding/total_lp_supply)
-        if burned_pct<99.:
+        # Integer comparison avoids rounding a borderline 98.999...% burn
+        # into a 99% pass. Do not treat unidentified LP lockers as burns.
+        if outstanding*100>total_lp_supply:
             return {'status':'unverified_lp_withdrawal_control','pool_creator':creator,
                     'lp_mint':lp_mint,'lp_supply_raw':outstanding,
                     'historical_lp_supply_raw':total_lp_supply,
@@ -172,25 +179,59 @@ class MicroRugGuard:
         except Exception as exc:
             return {'status':'unverified_pool_security','detail':type(exc).__name__}
 
-    def prefetch(self,pair,now):
-        """Warm on-chain reserve/security evidence without authorizing an entry.
+    @staticmethod
+    def _security_ttl(status):
+        if status=='verified_burned_lp_and_screened_holders':return 120.
+        # Permanent judgment is inappropriate: LP can be burned later.
+        # Recheck negative evidence after 90 seconds, but do not repeatedly
+        # fetch identical unchanged LP supply with every candidate poll.
+        if status in ('unverified_lp_withdrawal_control',
+                      'concentrated_wallet_supply'):return 90.
+        return 20.  # RPC/provider errors are transient, never proof of safety
 
-        This never trades. Existing negative LP/holder decisions are cached so
-        a high-volume discovery feed cannot repeatedly exhaust RPC capacity.
+    def _negative_cached(self,key,now):
+        entry=self._security_cache.get(key)
+        if not entry:return None
+        seen,verdict=entry
+        status=verdict.get('status','unverified_lp_or_holder_security')
+        if (status!='verified_burned_lp_and_screened_holders' and
+                0<=now-seen<self._security_ttl(status)):
+            return verdict
+        return None
+
+    def _note_unique(self,key,status):
+        if status and key[0] and key[1]:
+            self._unique_statuses.setdefault(key,set()).add(status)
+
+    def _prune_futures(self,now):
+        # A completed result for a candidate no longer revisited should not
+        # inflate pending counts indefinitely. Do not cancel active requests.
+        if now-self._last_prune<20:return
+        self._last_prune=now
+        for key,future in list(self._pending.items()):
+            if (future.done() and now-self._last.get(key,0)>90):
+                self._pending.pop(key,None)
+                self.completed_futures_pruned+=1
+        for key,future in list(self._security_pending.items()):
+            latest=self._snapshot_cache.get(key,(0,))[0]
+            if future.done() and now-latest>90:
+                self._security_pending.pop(key,None)
+                self.completed_futures_pruned+=1
+
+    def prefetch(self,pair,now):
+        """Prewarm verification; skip stable negative pools without RPC work.
+
+        Negative evidence expires and will be checked again. A cache hit
+        never authorizes an entry; `check` must still approve it.
         """
         self.prefetch_attempts+=1
         key=((pair.get('baseToken') or {}).get('address'),pair.get('pairAddress'))
-        if key in self._security_cache:
-            seen,verdict=self._security_cache[key]
-            status=verdict.get('status')
-            # A provider failure is not a 3-minute determination that a pool
-            # is unsafe. Retry transient RPC failures sooner; persistent LP
-            # withdrawal-control and holder concentration blocks last longer.
-            block_ttl=180 if status in (
-                'unverified_lp_withdrawal_control','concentrated_wallet_supply') else 20
-            if (0<=now-seen<block_ttl and
-                    status!='verified_burned_lp_and_screened_holders'):
-                return False,verdict.get('status','unverified_lp_or_holder_security'),{}
+        self._prune_futures(now)
+        verdict=self._negative_cached(key,now)
+        if verdict:
+            self.security_negative_cache_hits+=1
+            return False,verdict.get('status','unverified_lp_or_holder_security'),{
+                'security':verdict,'cache_status':'negative_expiring'}
         before=len(self._checks)
         result=self.check(pair,now)
         if len(self._checks)>before:self.prefetch_submitted+=1
@@ -202,6 +243,15 @@ class MicroRugGuard:
         if not valid_pubkey(mint) or not valid_pubkey(pool):
             return False,'unverified_pool_identity',{}
         key=(mint,pool)
+        self._prune_futures(now)
+        # Also cover entry-side check() calls (not only prefetch). A known
+        # unverified locker may never be interpreted as a positive LP pass.
+        verdict=self._negative_cached(key,now)
+        if verdict:
+            self.security_negative_cache_hits+=1
+            self._note_unique(key,verdict.get('status'))
+            return False,verdict.get('status','unverified_lp_or_holder_security'),{
+                'security':verdict,'cache_status':'negative_expiring'}
         task=self._pending.get(key)
         if task is not None and task.done():
             self._pending.pop(key,None)
@@ -210,6 +260,7 @@ class MicroRugGuard:
             if result.get('status')!='snapshot_ok':
                 why=result.get('status','unverified_pool_security')
                 self.reasons[why]+=1
+                self._note_unique(key,why)
                 return False,why,result
             self._snapshot_cache[key]=(now,result['snapshot'])
             if len(self._snapshot_cache)>1600:
@@ -217,6 +268,7 @@ class MicroRugGuard:
                     self._snapshot_cache.pop(old_key,None)
                     self.history.pop(old_key,None)
                     self._security_cache.pop(old_key,None)
+                    self._unique_statuses.pop(old_key,None)
                     self._last.pop(old_key,None)
         cached=self._snapshot_cache.get(key)
         # Consume completed results immediately and use a fresh snapshot for
@@ -244,10 +296,7 @@ class MicroRugGuard:
         # wait. A completed verdict is reused while the reserve path matures.
         result={'snapshot':snap,'status':'snapshot_ok'}
         cache=self._security_cache.get(key)
-        if cache and 0<=now-cache[0]<(120 if cache[1].get('status')=='verified_burned_lp_and_screened_holders'
-                                  else 180 if cache[1].get('status') in (
-                                      'unverified_lp_withdrawal_control','concentrated_wallet_supply')
-                                  else 20):
+        if cache and 0<=now-cache[0]<self._security_ttl(cache[1].get('status')):
             security=cache[1]
         else:
             fut=self._security_pending.get(key)
@@ -263,10 +312,13 @@ class MicroRugGuard:
         status=security.get('status')
         if status!='verified_burned_lp_and_screened_holders':
             self.reasons[status or 'unverified_lp_or_holder_security']+=1
+            self._note_unique(key,status or 'unverified_lp_or_holder_security')
             return False,status or 'unverified_lp_or_holder_security',result
+        self._note_unique(key,'lp_and_holder_passed')
         prior=[row for row in hist if 60<=snapshot_time-row[0]<=130]
         if not prior:
             self.reasons['unverified_60s_reserve_history']+=1
+            self._note_unique(key,'unverified_60s_reserve_history')
             return False,'unverified_60s_reserve_history',result
         older=max(prior,key=lambda row:row[0])
         decline=1.-int(snap['sol_vault_raw'])/max(1,older[1])
@@ -276,17 +328,53 @@ class MicroRugGuard:
                         mint,pool,100*decline)
         if decline>=.20:
             self.reasons['verified_sol_reserve_decline_20pct']+=1
+            self._note_unique(key,'verified_sol_reserve_decline_20pct')
             return False,'verified_sol_reserve_decline_20pct',result
+        self._note_unique(key,'pool_rug_evidence_passed')
         return True,'verified_micro_rug_evidence_not_rug_proof',result
+
+    def negative_pool_deferral_until(self,mint,now):
+        """Delay redundant micro-only lookups when ALL known mint pools fail.
+
+        This is an optimization, not a permanent blacklist. A newly
+        discovered pool may still enter verification independently. Never
+        suppress a pending verification or a pool with a positive verdict.
+        """
+        known=[(key,ts,verdict) for key,(ts,verdict) in self._security_cache.items()
+               if key[0]==mint]
+        if not known:return None
+        negative_keys={key for key,_,_ in known}
+        # A newly discovered second pool for the same mint must always get a
+        # chance to complete verification; suppress ONLY known-negative pools.
+        active_keys=set(self._snapshot_cache)|set(self._pending)|set(self._security_pending)
+        if any(key[0]==mint and key not in negative_keys for key in active_keys):
+            return None
+        for key,_,verdict in known:
+            if verdict.get('status')=='verified_burned_lp_and_screened_holders':
+                return None
+            if (key in self._pending and not self._pending[key].done()) or (
+                key in self._security_pending and not self._security_pending[key].done()):
+                return None
+        deadlines=[ts+self._security_ttl(v.get('status')) for _,ts,v in known]
+        if any(until<=now for until in deadlines):return None
+        return min(deadlines)
 
     def completed(self,mint):
         return (any(m==mint and future.done() for (m,_),future in self._pending.items()) or
                 any(m==mint and future.done() for (m,_),future in self._security_pending.items()))
 
     def stats(self):
+        unique=Counter(stage for stages in self._unique_statuses.values() for stage in stages)
+        cached=Counter(verdict.get('status','unknown') for _,verdict in self._security_cache.values())
         return {'rejections':dict(self.reasons),'pools_seen':len(self.history),
-                'pending_pool_checks':len(self._pending),
-                'pending_lp_holder_checks':len(self._security_pending),
+                'unique_pools_by_security_stage_since_restart':dict(unique),
+                'security_cache_by_latest_status':dict(cached),
+                'negative_security_cache_hits':self.security_negative_cache_hits,
+                'completed_futures_pruned':self.completed_futures_pruned,
+                'pending_pool_checks':sum(not f.done() for f in self._pending.values()),
+                'completed_pool_checks_waiting':sum(f.done() for f in self._pending.values()),
+                'pending_lp_holder_checks':sum(not f.done() for f in self._security_pending.values()),
+                'completed_lp_checks_waiting':sum(f.done() for f in self._security_pending.values()),
                 'pool_checks_per_minute_limit':self.max_pool_checks_per_minute,
                 'lock_contract_adapter':'not_supported; >=99pct proven_burned LP only',
                 'fresh_snapshot_cache_size':len(self._snapshot_cache),

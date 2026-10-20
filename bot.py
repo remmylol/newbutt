@@ -4403,6 +4403,9 @@ def run_background_age_study(*, scan_entries: bool) -> None:
                              report.get('v898_quote_accounted_closes',0),
                              report.get('v898_quote_stop_closes',0),
                              report.get('v898_pending_exit_statuses',{}))
+                    log.info('V900 MICRO UNIQUE ENTRY FUNNEL %s micro_run_id=%s '
+                             'counts_are_unique_pools_since_restart_not_attempts=True',
+                             report.get('micro_unique_funnel',{}),_age_study.micro_run_id)
                     log.info('V895 MICRO FILTER FUNNEL rejects=%s legacy_volume_would_block=%s minimum_5m_volume_usd=%s '
                              'minimum_change5_pct=0.8 minimum_buys5=10 minimum_sells5=1 '
                              'minimum_buy_sell_ratio=1.25 counts_are_attempts=True',
