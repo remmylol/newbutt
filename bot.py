@@ -500,6 +500,16 @@ _age_study = BackgroundAgeStudy(state_file=STATE_FILE, starting_capital=STARTING
     max_entry_market_cap_usd=MOMENTUM_MARKET_CAP_MAX_USD,
     enable_v893_research=V893_RESEARCH_ENABLED,
     research_guard=_v893_risk, research_quote_probe=_v893_quotes)
+# Paper-only shadow studies must not inherit an old loss-based halt from any
+# separately persisted study (including the historical 5_60 track). Apply the
+# policy BEFORE their ledgers are loaded. AgeTrack.load() preserves the past
+# reason in historical_halt_reason, clears the active flag on next save, and
+# preserves cash, positions, closed trades, and seen mints without reset.
+# This does NOT bypass the invalid-ledger read-only guard, the position limit,
+# negative cash checks, quote verification, or *live* execution freezes.
+if PAPER_MODE and AGE_0_60_PRIMARY and not LIVE_0_60_ENABLED:
+    for _paper_age_track in _age_study.tracks:
+        _paper_age_track.halts_enabled = False
 # The LIVE version replaces only the promoted 0_60 track with an isolated
 # real-execution ledger. All discovery + entry/exit decision code remains the
 # existing v8.7.8 AgeTrack.observe; background 5_60 stays indicative paper.
@@ -2290,11 +2300,13 @@ def shadow_risk_snapshot(state: dict, *, now: float | None = None, interval: flo
               state.get('paper_trade_metrics', {}).get(mint, {}).get('max_adverse_net_pct') is not None and
               as_float(state['paper_trade_metrics'][mint]['max_adverse_net_pct']) <= -SHADOW_SEVERE_POSITION_LOSS_HALT_PCT]
     pnl = sum(as_float(t.get('pnl_usd')) for t in trades)
-    log.info('PAPER SHADOW RISK AUDIT equity_risk=$%.2f cash=$%.2f baseline=$%.2f realized_pnl=$%.2f '
+    log.info('PAPER SHADOW RISK AUDIT historical_5_12_ledger=%s legacy_halt_does_not_block_promoted_0_60=%s '
+             'equity_risk=$%.2f cash=$%.2f baseline=$%.2f realized_pnl=$%.2f '
              'closed=%d paper_wins=%d writeoffs=%d writeoff_pnl=$%.2f impaired_open=%d '
              'open_positions=%d halt=%s halt_daily_loss=%s halt_writeoff=%s '
              'pending_exits=%d severely_drawn_open=%d halt_exit_safety=%s '
              'no_real_fills=True historical_trade_records_included=True',
+             bool(AGE_0_60_PRIMARY),bool(AGE_0_60_PRIMARY),
              equity(state),as_float(state.get('cash_usd')),as_float(state.get('day_start_equity')),
              pnl,len(trades),sum(as_float(t.get('pnl_usd')) > 0 for t in trades),
              len(writeoffs),sum(as_float(t.get('pnl_usd')) for t in writeoffs),
