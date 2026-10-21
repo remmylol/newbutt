@@ -4407,6 +4407,14 @@ def run_background_age_study(*, scan_entries: bool) -> None:
         if V893_RESEARCH_ENABLED:
             log.info('V893 RESEARCH RISK AUDIT %s quote_sidecar=%s paper_only=True entry_authorization_not_shared=True',
                      _v893_risk.summary(),_v893_quotes.totals)
+        # v909: transparent 3-arm paper experiment status. Each new variant
+        # carries an independent persistent ledger, has no signing authority,
+        # and does not change the canonical micro trader or its run ID.
+        if V893_RESEARCH_ENABLED and hasattr(_age_study,'v909_comparison'):
+            log.info('V909 PAPER MICRO COMPARISON %s '
+                     'realized_only=True unresolved_positions_not_marked_as_sales=True '
+                     'existing_micro_primary_unchanged=True',
+                     _age_study.v909_comparison())
         for report in reports:
             if V893_RESEARCH_ENABLED and report['track'] in ('adaptive_0_60','micro_0_60'):
                 log.info('V893 RESEARCH TRACK FUNNEL track=%s risk_or_route_blocks=%s market_cap_floor_usd=%s same_pool_liquidity_floor_usd=%s max_change5_pct=%s indicative_only=True',
