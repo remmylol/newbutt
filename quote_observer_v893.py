@@ -33,6 +33,12 @@ class QuoteObserver:
         self.micro_inline_join_successes=0
         self.micro_inline_join_timeouts=0
         self.micro_inline_join_rejections=0
+        # v906: urgent held exits use a separate executor, bounded inline wait
+        # and a same-cycle replacement when a completed result has expired.
+        self.micro_urgent_exit_inline_successes=0
+        self.micro_urgent_exit_inline_timeouts=0
+        self.micro_exit_stale_resubmits=0
+        self.micro_urgent_exit_last_status={}
     def entry_stats(self,now=None):
         """Non-sensitive read-only quote-budget diagnostics for micro audits."""
         stamp=time.time() if now is None else now
@@ -47,7 +53,11 @@ class QuoteObserver:
                 'v904_inline_join_successes':self.micro_inline_join_successes,
                 'v904_inline_join_timeouts':self.micro_inline_join_timeouts,
                 'v904_inline_join_rejections':self.micro_inline_join_rejections,
-                'v904_inline_wait_seconds':self.micro_join_wait_seconds}
+                'v904_inline_wait_seconds':self.micro_join_wait_seconds,
+                'v906_urgent_exit_inline_successes':self.micro_urgent_exit_inline_successes,
+                'v906_urgent_exit_inline_timeouts':self.micro_urgent_exit_inline_timeouts,
+                'v906_stale_exit_resubmits':self.micro_exit_stale_resubmits,
+                'v906_urgent_exit_last_status':dict(self.micro_urgent_exit_last_status)}
 
     def _roundtrip_network(self,mint,size,amount,sol_usd):
         """Off-thread two-sided read-only quote lookup."""
@@ -400,9 +410,35 @@ class QuoteObserver:
         except (requests.RequestException,ValueError,TypeError,KeyError,OverflowError,IndexError):
             return {'status':'unverified_sell_quote_unavailable'}
 
-    def probe_micro_sell(self,mint,rec,pair,*,now=None):
-        """Bounded nonblocking micro-only held-position exit quote polling."""
-        stamp=time.time() if now is None else now
+    def _micro_exit_result(self, result, pool, start, stamp):
+        """Never promote a stale/wrong-pool/non-finite network quote to a sale."""
+        elapsed=stamp-start
+        if not 0 <= elapsed <= 7:
+            return {'status':'unverified_stale_sell_quote'}
+        response=dict(result)
+        response['quote_age_seconds']=round(elapsed,3)
+        response['quote_request_epoch']=start
+        # Only a successful exact-pool Jupiter response can ever be credited.
+        if response.get('status')=='pinned_pool_sell_quote_not_fill':
+            try:
+                amount=float(response['minimum_usd_out_estimate'])
+            except (KeyError,TypeError,ValueError,OverflowError):
+                return {'status':'unverified_sell_quote_metadata'}
+            if (response.get('pool')!=pool or not math.isfinite(amount) or
+                    amount<0):
+                return {'status':'unverified_sell_quote_metadata'}
+        return response
+
+    def probe_micro_sell(self,mint,rec,pair,*,now=None,urgent=False,
+                         wait_seconds=0.0):
+        """Quote a HELD paper position. An urgent check can synchronously join
+        a fresh request (max 2.75 s); all quote/route/age requirements stay.
+
+        Nonurgent callers remain fully nonblocking and retain their historical
+        stale-future behavior. No network request is made on behalf of a real
+        wallet, and an unavailable quote never creates fictitious proceeds.
+        """
+        stamp=time.time() if now is None else float(now)
         pool=rec.get('pool')
         buy=(rec.get('entry_route_quote') or
              (rec.get('research_risk_evidence') or {}).get('entry_route_quote') or {})
@@ -422,35 +458,104 @@ class QuoteObserver:
             self._micro_exit_pending={};self._micro_exit_cache={}
             self._micro_exit_calls=deque()
         key=(mint,pool,amount)
+        def present_time():
+            # Production normally passes a snapshot time captured moments ago;
+            # tests often use a fixed synthetic clock. Preserve both without
+            # treating a several-second inline wait as if zero time elapsed.
+            actual=time.time()
+            return actual if abs(actual-stamp)<60 else stamp
+
+        def take_result(start,fut,*,clock):
+            try:result=fut.result()
+            except Exception:result={'status':'unverified_sell_quote_unavailable'}
+            verified=self._micro_exit_result(result,pool,start,clock)
+            if verified.get('status')!='unverified_stale_sell_quote':
+                self._micro_exit_cache[key]=(start,result)
+            else:
+                self._micro_exit_cache.pop(key,None)
+            return verified
+
         pending=self._micro_exit_pending.get(key)
         if pending is not None:
             start,fut=pending
-            if not fut.done():return {'status':'unverified_sell_quote_pending'}
-            self._micro_exit_pending.pop(key,None)
-            try:result=fut.result()
-            except Exception:result={'status':'unverified_sell_quote_unavailable'}
-            # Do not claim an old network quote is fresh simply because its
-            # Future was collected now; restart the request on next poll.
-            if not 0<=stamp-start<=7:
+            clock=present_time()
+            if fut.done():
+                self._micro_exit_pending.pop(key,None)
+                response=take_result(start,fut,clock=clock)
+                if response['status']!='unverified_stale_sell_quote' or not urgent:
+                    return response
+                # Before v906 an expired finished future COST ANOTHER scan to
+                # start a new request. An urgent holder cannot afford that.
+                self.micro_exit_stale_resubmits+=1
+                v902_log.info('V906 MICRO EXIT STALE REQUOTE mint=%s pool=%s '
+                              'old_age_s=%.3f new_quote_same_cycle=True '
+                              'no_credit_from_stale=True',mint,pool,clock-start)
+            elif clock-start>7 and urgent:
+                # Stuck provider future: unlink but don't use its response.
+                self._micro_exit_pending.pop(key,None)
                 self._micro_exit_cache.pop(key,None)
-                return {'status':'unverified_stale_sell_quote'}
-            self._micro_exit_cache[key]=(start,result)
-            return dict(result,quote_age_seconds=round(stamp-start,3),
-                        quote_request_epoch=start)
+                self.micro_exit_stale_resubmits+=1
+            elif urgent and wait_seconds>0:
+                from concurrent.futures import TimeoutError as _WaitTimeout
+                try:
+                    fut.result(timeout=max(0.,min(float(wait_seconds),2.75)))
+                except _WaitTimeout:
+                    self.micro_urgent_exit_inline_timeouts+=1
+                    return {'status':'unverified_sell_quote_pending'}
+                except Exception:
+                    pass
+                self._micro_exit_pending.pop(key,None)
+                response=take_result(start,fut,clock=present_time())
+                if response['status']!='unverified_stale_sell_quote':
+                    if response['status']=='pinned_pool_sell_quote_not_fill':
+                        self.micro_urgent_exit_inline_successes+=1
+                    return response
+                self.micro_exit_stale_resubmits+=1
+            else:
+                return {'status':'unverified_sell_quote_pending'}
+
+        clock=present_time()
         cached=self._micro_exit_cache.get(key)
-        if cached and 0<=stamp-cached[0]<=5:
-            return dict(cached[1],quote_age_seconds=round(stamp-cached[0],3),
-                        quote_request_epoch=cached[0])
-        while self._micro_exit_calls and stamp-self._micro_exit_calls[0]>=60:
+        if cached and 0<=clock-cached[0]<=5:
+            return self._micro_exit_result(cached[1],pool,cached[0],clock)
+        if cached:self._micro_exit_cache.pop(key,None)
+        while self._micro_exit_calls and clock-self._micro_exit_calls[0]>=60:
             self._micro_exit_calls.popleft()
-        # Reserve four calls/min for mandatory age-five and risk-triggered
-        # exits; routine quote monitoring cannot consume that headroom.
-        urgent=bool(rec.get('age_five_exit_prearmed') or rec.get('pending_exit_reason') or
-                    float(rec.get('last_liquidity',1e100))<=
-                    .60*float(rec.get('entry_liquidity',0)))
-        if len(self._micro_exit_calls)>=(12 if urgent else 8):
+        priority=bool(urgent or rec.get('age_five_exit_prearmed') or
+                      rec.get('pending_exit_reason') or
+                      float(rec.get('last_liquidity',1e100))<=
+                      .60*float(rec.get('entry_liquidity',0)))
+        if len(self._micro_exit_calls)>=(12 if priority else 8):
+            if priority:self.micro_urgent_exit_last_status[mint]='unverified_micro_sell_quote_budget'
             return {'status':'unverified_micro_sell_quote_budget'}
-        self._micro_exit_calls.append(stamp)
-        self._micro_exit_pending[key]=(stamp,self._micro_exit_executor.submit(
-            self._micro_sell_network,mint,pool,amount,sol_usd))
-        return {'status':'unverified_sell_quote_pending'}
+        self._micro_exit_calls.append(clock)
+        future=self._micro_exit_executor.submit(self._micro_sell_network,
+                                                 mint,pool,amount,sol_usd)
+        self._micro_exit_pending[key]=(clock,future)
+        if not urgent or wait_seconds<=0:
+            return {'status':'unverified_sell_quote_pending'}
+        from concurrent.futures import TimeoutError as _WaitTimeout
+        try:
+            future.result(timeout=max(0.,min(float(wait_seconds),2.75)))
+        except _WaitTimeout:
+            self.micro_urgent_exit_inline_timeouts+=1
+            self.micro_urgent_exit_last_status[mint]='unverified_sell_quote_pending'
+            v902_log.info('V906 MICRO URGENT EXIT mint=%s pool=%s '
+                          'status=awaiting_fresh_sell_quote no_paper_sale=True',mint,pool)
+            return {'status':'unverified_sell_quote_pending'}
+        except Exception:
+            pass
+        self._micro_exit_pending.pop(key,None)
+        result=take_result(clock,future,clock=present_time())
+        self.micro_urgent_exit_last_status[mint]=result['status']
+        if result['status']=='pinned_pool_sell_quote_not_fill':
+            self.micro_urgent_exit_inline_successes+=1
+        v902_log.info('V906 MICRO URGENT EXIT mint=%s pool=%s status=%s '
+                      'quote_age_s=%s same_pool_required=True paper_only=True',
+                      mint,pool,result['status'],result.get('quote_age_seconds'))
+        return result
+
+    def probe_micro_sell_urgent(self,mint,rec,pair,*,now=None):
+        """Bounded same-cycle held-exit path; never authorizes a live fill."""
+        return self.probe_micro_sell(mint,rec,pair,now=now,urgent=True,
+                                     wait_seconds=2.75)

@@ -405,12 +405,22 @@ class AgeTrack:
                 if urgent_age:
                     rec['age_five_exit_prearmed']=True
                 last_poll=float(rec.get('last_micro_sell_quote_check_at',0))
-                quote_due=(urgent_age or stamp-last_poll>=12 or
-                           e['liquidity']<=rec['entry_liquidity']*.90 or
-                           bool(rec.get('pending_exit_reason')))
+                urgent_risk=(bool(rec.get('pending_exit_reason')) or
+                             micro_age_exit or net_pct<=-9. or
+                             e['liquidity']<=rec['entry_liquidity']*.60)
+                quote_due=(urgent_age or stamp-last_poll>=12 or urgent_risk or
+                           e['liquidity']<=rec['entry_liquidity']*.90)
                 if quote_due:
                     rec['last_micro_sell_quote_check_at']=stamp
-                    token_quote=self.research_quote_probe.probe_micro_sell(mint,rec,pair,now=stamp)
+                    # v906: Keep routine observation nonblocking, but once a
+                    # risk/age exit is due, JOIN a fresh sell quote promptly.
+                    # Legacy/mock observers retain their existing interface.
+                    urgent_probe=getattr(self.research_quote_probe,
+                                         'probe_micro_sell_urgent',None)
+                    token_quote=(urgent_probe(mint,rec,pair,now=stamp)
+                                 if urgent_risk and callable(urgent_probe)
+                                 else self.research_quote_probe.probe_micro_sell(
+                                     mint,rec,pair,now=stamp))
                     rec['held_sell_quote_status']=token_quote.get('status')
                     if token_quote.get('status')=='pinned_pool_sell_quote_not_fill':
                         try:
@@ -491,7 +501,11 @@ class AgeTrack:
                         rec['exit_quote_status']='unverified_micro_sell_probe_not_installed'
                         self.changed=True
                         return 'pending_exit:'+reason
+                    urgent_probe=getattr(self.research_quote_probe,
+                                         'probe_micro_sell_urgent',None)
                     quote=(token_quote if token_quote is not None else
+                           urgent_probe(mint,rec,pair,now=stamp)
+                           if callable(urgent_probe) else
                            self.research_quote_probe.probe_micro_sell(mint,rec,pair,now=stamp))
                     # Also reject incomplete, stale and wrong-pool estimates.
                     quote_age=quote.get('quote_age_seconds',float('inf'))
@@ -506,6 +520,14 @@ class AgeTrack:
                             not 0<=quote_age<=7):
                         rec['pending_exit_reason']=reason
                         rec['exit_quote_status']=quote.get('status','unverified_sell_quote')
+                        rec['last_exit_attempt_at']=stamp
+                        rec['unverified_exit_attempts']=int(rec.get('unverified_exit_attempts',0))+1
+                        if rec['unverified_exit_attempts'] in (1,5,15,30):
+                            v902_log.warning('V906 MICRO EXIT STILL PENDING mint=%s pool=%s '
+                                'reason=%s quote_status=%s attempts=%d spot_return_pct=%.2f '
+                                'pool_liquidity_usd=%.2f no_fictitious_sale=True',
+                                mint,rec['pool'],reason,rec['exit_quote_status'],
+                                rec['unverified_exit_attempts'],net_pct,e['liquidity'])
                         self.changed=True
                         return 'pending_exit:'+reason
                     # Min quote out is still only an indicative estimate, not
@@ -1043,12 +1065,16 @@ class BackgroundAgeStudy:
         pending=[]
         for mint,rec in micro.positions.items():
             age=float(rec.get('entry_age_minutes',60))+(stamp-float(rec['opened_at']))/60.
-            if (rec.get('pending_exit_reason') or
-                (float(rec.get('entry_age_minutes',60))<5. and age>=4.25)):
-                last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))
-                if stamp-last>=3:
-                    pending.append((0 if rec.get('pending_exit_reason') else 1,
-                                    (5.-age if age<5. else 0),last,mint))
+            pending_exit=bool(rec.get('pending_exit_reason'))
+            age_exit=(float(rec.get('entry_age_minutes',60))<5. and age>=4.25)
+            last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))
+            # v906: all held micro positions get a dedicated observation about
+            # every 8 seconds, not only after a stop has ALREADY been noticed.
+            # Otherwise a fast rug can occur between 15+ second checks. The
+            # fast scheduler remains bounded and gives pending exits priority.
+            if stamp-last>=(3 if pending_exit or age_exit else 8):
+                priority=0 if pending_exit else 1 if age_exit else 2
+                pending.append((priority,(5.-age if age<5. else 0),last,mint))
         return [mint for *_,mint in sorted(pending)[:limit]]
 
     def missing(self,mint:str,*,now:float|None=None,micro_only:bool=False):

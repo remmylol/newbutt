@@ -4301,7 +4301,7 @@ def run_background_age_study(*, scan_entries: bool) -> None:
                 normal_limit=min(3,SHADOW_AGE_STUDY_FETCH_PER_SCAN)
                 # Held mandatory exits get first look at available slots,
                 # before entry discovery and its less urgent callback queue.
-                urgent=_age_study.micro_urgent_held(now=stamp,limit=2)
+                urgent=_age_study.micro_urgent_held(now=stamp,limit=3)
                 due_mints=list(urgent)
                 extra_mints.update(urgent)
                 due_mints.extend(m for m in _age_study.due(now=stamp,limit=normal_limit)
@@ -4400,6 +4400,27 @@ def run_background_age_study(*, scan_entries: bool) -> None:
                              _v893_risk.max_rpc_per_minute,len(_v893_risk._pending),
                              _v893_quotes.entry_stats(),(_micro_v895_rug.stats() if _micro_v895_rug else None),
                              _age_study.micro_run_id)
+                    # v906: surface the reason an unsellable micro position
+                    # remains OPEN. Never claim a sale without a fresh,
+                    # pinned same-pool minimum-out quote.
+                    micro_track=next((t for t in _age_study.tracks
+                                      if t.name=='micro_0_60'),None)
+                    if micro_track is not None:
+                        for held_mint,held_rec in micro_track.positions.items():
+                            if (held_rec.get('pending_exit_reason') or
+                                    float(held_rec.get('last_net_pct',0))<=-20):
+                                log.warning('V906 MICRO HELD EXIT AUDIT mint=%s pool=%s '
+                                    'pending_reason=%s quote_status=%s '
+                                    'quote_attempts=%d last_spot_return_pct=%s '
+                                    'entry_liquidity_usd=%s last_liquidity_usd=%s '
+                                    'no_confirmed_paper_sale=True',
+                                    held_mint,held_rec.get('pool'),
+                                    held_rec.get('pending_exit_reason'),
+                                    held_rec.get('exit_quote_status'),
+                                    held_rec.get('unverified_exit_attempts',0),
+                                    held_rec.get('last_net_pct'),
+                                    held_rec.get('entry_liquidity'),
+                                    held_rec.get('last_liquidity'))
                     log.info('V898 MICRO EXIT INTEGRITY pinned_buy_sell_quotes=True '
                              'conservative_buy_minimum_inventory=True held_quote_poll_12s=True '
                              'maximum_quote_age_s=7 age5_prearm_min=4.25 '
