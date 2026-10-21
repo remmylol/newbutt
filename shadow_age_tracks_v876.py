@@ -80,6 +80,28 @@ def valid_flow(pair: dict, e: dict, *, surge_change: float=13.5,
         min_volume5_usd=min_volume5_usd)
 
 
+def v910_modeled_profit_quote_priority(rec: dict, *, take_profit_pct: float=25.,
+                                       activation_pct: float=8.,
+                                       reversal_points: float=4.) -> str | None:
+    """Scheduling hint ONLY: never authorizes sale or updates quoted peaks.
+
+    Spot-derived returns can be unrealizable. These hints request urgent
+    read-only Jupiter quotes rather than treating spot marks as proceeds.
+    """
+    try:
+        last=float(rec.get('last_net_pct',float('-inf')))
+        peak=float(rec.get('peak_net_pct',float('-inf')))
+    except (TypeError,ValueError,OverflowError):
+        return None
+    if not (math.isfinite(last) and math.isfinite(peak)):
+        return None
+    if last>=take_profit_pct:
+        return 'modeled_take_profit_requote'
+    if peak>=activation_pct and last<=peak-reversal_points and last<peak:
+        return 'modeled_trailing_reversal_requote'
+    return None
+
+
 class AgeTrack:
     VERSION=1
     def __init__(self, *, name: str, min_age: float, path: Path,
@@ -428,6 +450,19 @@ class AgeTrack:
             # The $2 micro position is modeled using the conservative buy
             # minimum and a freshly verified exact-pool sell minimum. Dex
             # price-only returns are retained solely for comparison.
+            # v910: A strong MODELLED gain or sharp decline from a modelled
+            # high only prioritizes a fresh quote; it can NEVER itself sell.
+            # Unlike stop/age exits, this is not a pending liquidation intent
+            # until a verified, pinned-pool minimum confirms the threshold.
+            profit_quote_hint=(v910_modeled_profit_quote_priority(
+                rec,take_profit_pct=self.take_profit_net_pct,
+                activation_pct=self.trailing_activation_net_pct,
+                reversal_points=self.trailing_drawdown_pct_points)
+                if self.micro_mode and self.take_profit_enabled else None)
+            if profit_quote_hint:
+                rec['v910_profit_quote_priority_reason']=profit_quote_hint
+            else:
+                rec.pop('v910_profit_quote_priority_reason',None)
             token_quote=None
             if (self.micro_mode and self.research_quote_probe is not None and
                     hasattr(self.research_quote_probe,'probe_micro_sell')):
@@ -440,20 +475,39 @@ class AgeTrack:
                 urgent_risk=(bool(rec.get('pending_exit_reason')) or
                              micro_age_exit or net_pct<=-9. or
                              e['liquidity']<=rec['entry_liquidity']*.60)
+                # v910: urgent profit-quote attempts are bounded to one per
+                # portfolio every 10s; this prevents multiple paper variants
+                # sharing a mint from monopolizing the held-sell API budget.
+                profit_quote_due=bool(profit_quote_hint and stamp-last_poll>=10.)
                 quote_due=(urgent_age or stamp-last_poll>=12 or urgent_risk or
+                           profit_quote_due or
                            e['liquidity']<=rec['entry_liquidity']*.90)
                 if quote_due:
                     rec['last_micro_sell_quote_check_at']=stamp
+                    if profit_quote_due:
+                        rec['v910_profit_quote_attempts']=int(
+                            rec.get('v910_profit_quote_attempts',0))+1
+                        rec['v910_last_profit_quote_attempt_at']=stamp
                     # v906: Keep routine observation nonblocking, but once a
                     # risk/age exit is due, JOIN a fresh sell quote promptly.
                     # Legacy/mock observers retain their existing interface.
                     urgent_probe=getattr(self.research_quote_probe,
                                          'probe_micro_sell_urgent',None)
                     token_quote=(urgent_probe(mint,rec,pair,now=stamp)
-                                 if urgent_risk and callable(urgent_probe)
+                                 if (urgent_risk or profit_quote_due) and callable(urgent_probe)
                                  else self.research_quote_probe.probe_micro_sell(
                                      mint,rec,pair,now=stamp))
                     rec['held_sell_quote_status']=token_quote.get('status')
+                    if profit_quote_due:
+                        attempts=rec['v910_profit_quote_attempts']
+                        if attempts in (1,5,15,30) or (
+                                attempts%30==0 and attempts>30):
+                            v902_log.info('V910 MICRO PROFIT REQUOTE track=%s mint=%s '
+                                'pool=%s hint=%s modeled_pct=%.2f '
+                                'modeled_peak_pct=%.2f quote_status=%s attempts=%d '
+                                'quote_is_only_exit_authority=True paper_only=True',
+                                self.name,mint,rec['pool'],profit_quote_hint,net_pct,
+                                rec['peak_net_pct'],rec['held_sell_quote_status'],attempts)
                     if token_quote.get('status')=='pinned_pool_sell_quote_not_fill':
                         try:
                             minimum=float(token_quote['minimum_usd_out_estimate'])
@@ -1251,20 +1305,29 @@ class BackgroundAgeStudy:
         pending=[]
         held_mints={}
         for track in [micro]+self.v909_experiment_tracks:
-            # Primary held position always wins duplicate-mint precedence.
+            # Co-held mints are rechecked ONCE across the portfolios, but their
+            # highest-priority exit determines lookup priority. Never allow a
+            # quiet primary position to mask a profit-recovery sidecar.
             for mint,rec in track.positions.items():
-                held_mints.setdefault(mint,rec)
-        for mint,rec in held_mints.items():
-            age=float(rec.get('entry_age_minutes',60))+(stamp-float(rec['opened_at']))/60.
-            pending_exit=bool(rec.get('pending_exit_reason'))
-            age_exit=(float(rec.get('entry_age_minutes',60))<5. and age>=4.25)
+                held_mints.setdefault(mint,[]).append((track,rec))
+        for mint,records in held_mints.items():
+            pending_exit=any(bool(rec.get('pending_exit_reason')) for _,rec in records)
+            ages=[float(rec.get('entry_age_minutes',60))+
+                  (stamp-float(rec['opened_at']))/60. for _,rec in records]
+            age_exit=any(float(rec.get('entry_age_minutes',60))<5. and age>=4.25
+                         for (_,rec),age in zip(records,ages))
+            profit_priority=any(v910_modeled_profit_quote_priority(
+                rec,take_profit_pct=track.take_profit_net_pct,
+                activation_pct=track.trailing_activation_net_pct,
+                reversal_points=track.trailing_drawdown_pct_points)
+                for track,rec in records if track.take_profit_enabled)
             last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))
-            # v906: all held micro positions get a dedicated observation about
-            # every 8 seconds, not only after a stop has ALREADY been noticed.
-            # Otherwise a fast rug can occur between 15+ second checks. The
-            # fast scheduler remains bounded and gives pending exits priority.
-            if stamp-last>=(3 if pending_exit or age_exit else 8):
-                priority=0 if pending_exit else 1 if age_exit else 2
+            # v910: verified stops/mandatory exits still win. A high spot
+            # profit only gets a bounded fresh-pool lookup + quote opportunity,
+            # never an automatic sale or an unlimited API budget.
+            if stamp-last>=(3 if pending_exit or age_exit else 6 if profit_priority else 8):
+                priority=0 if pending_exit else 1 if age_exit else 2 if profit_priority else 3
+                age=min(ages)
                 pending.append((priority,(5.-age if age<5. else 0),last,mint))
         return [mint for *_,mint in sorted(pending)[:limit]]
 

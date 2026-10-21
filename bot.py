@@ -4415,6 +4415,26 @@ def run_background_age_study(*, scan_entries: bool) -> None:
                      'realized_only=True unresolved_positions_not_marked_as_sales=True '
                      'existing_micro_primary_unchanged=True',
                      _age_study.v909_comparison())
+            # v910: no spot-only take profit claims. Show which held paper
+            # portfolios are awaiting confirmed, exact-pool sell minimums.
+            for profit_track in _age_study.tracks:
+                if not getattr(profit_track,'micro_mode',False):
+                    continue
+                for profit_mint,profit_rec in profit_track.positions.items():
+                    if profit_rec.get('v910_profit_quote_priority_reason'):
+                        log.info('V910 MICRO PROFIT EXIT AUDIT track=%s mint=%s '
+                            'pool=%s hint=%s modeled_return_pct=%s '
+                            'modeled_peak_pct=%s last_sell_quote_status=%s '
+                            'last_verified_sell_return_pct=%s '
+                            'profit_requotes=%d pending_exit=%s '
+                            'modeled_gain_not_a_verified_exit=True paper_only=True',
+                            profit_track.name,profit_mint,profit_rec.get('pool'),
+                            profit_rec.get('v910_profit_quote_priority_reason'),
+                            profit_rec.get('last_net_pct'),profit_rec.get('peak_net_pct'),
+                            profit_rec.get('held_sell_quote_status'),
+                            profit_rec.get('held_sell_quote_return_pct'),
+                            profit_rec.get('v910_profit_quote_attempts',0),
+                            profit_rec.get('pending_exit_reason'))
         for report in reports:
             if V893_RESEARCH_ENABLED and report['track'] in ('adaptive_0_60','micro_0_60'):
                 log.info('V893 RESEARCH TRACK FUNNEL track=%s risk_or_route_blocks=%s market_cap_floor_usd=%s same_pool_liquidity_floor_usd=%s max_change5_pct=%s indicative_only=True',
