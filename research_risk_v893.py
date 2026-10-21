@@ -127,8 +127,18 @@ class ResearchRiskGate:
         self.rpc_url=rpc_url.strip();self.strict=bool(strict)
         self.max_rpc_per_minute=max(1,int(max_rpc_per_minute))
         self.calls=collections.deque();self.cache={}
-        self._executor=ThreadPoolExecutor(max_workers=2,thread_name_prefix='v893_rpc')
+        # V907: four bounded workers prevent 9-12 mint checks from queuing behind
+        # two slow requests. Existing rolling calls/minute still caps throughput.
+        self._executor=ThreadPoolExecutor(max_workers=4,thread_name_prefix='v893_rpc')
         self._pending={}
+        self._pending_started={}
+        self._v907_completed_rpc={}  # scheduling hints, NOT authorization
+        self.v907_prefetch_calls=0;self.v907_prefetch_submitted=0
+        self.v907_mint_callbacks_consumed=0
+        self.v907_full_risk_approvals=0
+        self.v907_pending_mint_after_pool_ready=0
+        self._v907_logged_stage={}
+        self._v907_approved_mint_pool=set()
         self.reasons=collections.Counter();self.momentum=MomentumHistory()
         self.micro_rug_guard=micro_rug_guard
     def observe(self,pair,now):
@@ -182,56 +192,137 @@ class ResearchRiskGate:
             return result
         except (requests.RequestException,ValueError,KeyError,TypeError):
             return {'status':'unverified_rpc_failure'}
+    def drain_completed(self,now):
+        """Harvest finished mint checks without requiring a repeat candidate scan.
+
+        The completion only caches read-only mint evidence and wakes a lookup.
+        It never becomes entry authorization without the normal allow_micro().
+        Preserve RPC-request time for cache age: delayed responses cannot be
+        artificially made newer by callback collection.
+        """
+        for mint,future in list(self._pending.items())[:32]:
+            if not future.done():
+                continue
+            self._pending.pop(mint,None)
+            started=self._pending_started.pop(mint,now)
+            try: result=future.result()
+            except Exception:result={'status':'unverified_rpc_failure'}
+            if not isinstance(result,dict):
+                result={'status':'unverified_rpc_failure'}
+            self.cache[mint]=(min(now,started),result)
+            self._v907_completed_rpc[mint]=now
+            self.v907_mint_callbacks_consumed+=1
+            if result.get('status') not in VERIFIED_MINT_STATUSES:
+                audit_log.warning(
+                    'V907 MICRO MINT CALLBACK mint=%s status=%s '
+                    'owner_program=%s security_not_bypassed=True',
+                    mint,result.get('status','unknown'),
+                    result.get('owner_program','unknown'))
+
+    def recently_completed_mints(self,now):
+        """Short-lived wake signals; NEVER claim a safety approval."""
+        for mint,completed in tuple(self._v907_completed_rpc.items()):
+            if not 0<=now-completed<=15:
+                self._v907_completed_rpc.pop(mint,None)
+        return {mint for mint in self._v907_completed_rpc
+                if self.cache.get(mint,({},{}))[1].get('status') in
+                VERIFIED_MINT_STATUSES}
+
+    def prefetch_micro_mint(self,mint,now):
+        """Start mint verification alongside a plausible pool's first LP scan."""
+        self.v907_prefetch_calls+=1
+        already_pending=mint in self._pending
+        result=self.authority(mint,now,retry_transient=True)
+        if (not already_pending and mint in self._pending and
+                result.get('status')=='unverified_rpc_pending'):
+            self.v907_prefetch_submitted+=1
+        return result
+
     def authority(self,mint,now,*,retry_transient=False):
+        self.drain_completed(now)
         cached=self.cache.get(mint)
         if cached:
-            # Do not cache temporary RPC/provider failures for fifteen minutes.
-            # Never retry until the brief cooldown has passed; completed
-            # futures are consumed once, and the original per-minute RPC
-            # budget remains in force.
             transient=cached[1].get('status') in (
                 'unverified_rpc_failure','unverified_missing_mint_account')
             ttl=15 if (transient and retry_transient) else 900
             if 0<=now-cached[0]<ttl:return cached[1]
         pending=self._pending.get(mint)
         if pending is not None:
-            if not pending.done():return {'status':'unverified_rpc_pending'}
-            self._pending.pop(mint,None)
-            try: result=pending.result()
-            except Exception:result={'status':'unverified_rpc_failure'}
-            self.cache[mint]=(now,result)
-            # Emit this once when the completed asynchronous RPC response is
-            # collected, NOT on every repeat candidate evaluation. This log
-            # includes public addresses only: never the RPC URL or API key.
-            status=result.get('status','unknown')
-            if status not in VERIFIED_MINT_STATUSES:
-                audit_log.warning(
-                    'V893 RESEARCH RPC MINT AUDIT mint=%s status=%s '
-                    'owner_program=%s parsed_type=%s account_executable=%s '
-                    'blocked_extensions=%s paper_entry_denied=%s',
-                    mint,status,result.get('owner_program','unknown'),
-                    result.get('parsed_type','unknown'),
-                    result.get('account_executable','unknown'),
-                    result.get('blocked_extensions','none'),self.strict)
-            return result
+            return {'status':'unverified_rpc_pending'}
         while self.calls and now-self.calls[0]>=60:self.calls.popleft()
         if not self.rpc_url.startswith('https://'):
             return {'status':'unverified_no_https_rpc'}
         if len(self.calls)>=self.max_rpc_per_minute:
             return {'status':'unverified_rpc_budget'}
         self.calls.append(now)
+        self._pending_started[mint]=now
         self._pending[mint]=self._executor.submit(self._authority_lookup,mint)
         return {'status':'unverified_rpc_pending'}
+
+    def _v907_stage(self,mint,pool,mint_status,pool_status,reason,now):
+        """Per-pool transition log; no presumption that any proof is timeless."""
+        key=(mint,pool)
+        stage=(mint_status,pool_status,reason)
+        prior=self._v907_logged_stage.get(key)
+        if prior is None or stage!=prior[1] or now-prior[0]>=45:
+            audit_log.info(
+                'V907 MICRO RESEARCH JOIN mint=%s pool=%s mint_status=%s '
+                'lp_cache_status=%s final_reason=%s security_and_quote_required=True '
+                'paper_only=True',mint,pool,mint_status,pool_status,reason)
+            self._v907_logged_stage[key]=(now,stage)
+        if len(self._v907_logged_stage)>2500:
+            for old,_ in sorted(self._v907_logged_stage.items(),
+                    key=lambda entry: entry[1][0])[:300]:
+                self._v907_logged_stage.pop(old,None)
+
     def allow_micro(self,pair,e,now,*,min_cap_usd=3000.):
+        # V907: If an on-chain LP/holder check has ALREADY proved the pool
+        # unsuitable and its negative cache is still valid, don't waste
+        # scarce mint RPC work on it. Expired evidence is always rechecked.
+        # Unknown or pending LP evidence never becomes safety approval.
+        guard=self.micro_rug_guard
+        pool=pair.get('pairAddress') or ''
+        key=(e['mint'],pool)
+        if guard is not None and hasattr(guard,'_negative_cached'):
+            known_unsafe=guard._negative_cached(key,now)
+            if known_unsafe is not None and known_unsafe.get('status') in (
+                    'unverified_lp_withdrawal_control',
+                    'concentrated_wallet_supply'):
+                reason=known_unsafe['status']
+                self.reasons[reason]+=1
+                self._v907_stage(e['mint'],pool,'not_requested_unsafe_lp',
+                    reason,reason,now)
+                return False,reason,{'micro_pool_evidence':{
+                    'security':known_unsafe,'cache_status':'negative_expiring'}}
         ok,reason,details=self.allow(pair,e,now,min_cap_usd=min_cap_usd,
             require_volume5=False,micro_fast_retry=True)
-        if not ok:return ok,reason,details
-        if self.micro_rug_guard is None:
+        pool=(pair.get('pairAddress') or '')
+        guard=self.micro_rug_guard
+        entry=(getattr(guard,'_security_cache',{}) or {}).get((e['mint'],pool))
+        pool_status=((entry[1] or {}).get('status') if entry else 'not_lp_verified')
+        if not ok:
+            if (guard is not None and
+                    reason in ('unverified_rpc_pending','unverified_rpc_budget') and
+                    pool_status=='verified_burned_lp_and_screened_holders'):
+                self.v907_pending_mint_after_pool_ready+=1
+            self._v907_stage(e['mint'],pool,details.get('status','unknown'),
+                             pool_status,reason,now)
+            return ok,reason,details
+        if guard is None:
+            self._v907_stage(e['mint'],pool,details.get('status','unknown'),
+                             pool_status,'unverified_micro_rug_guard_not_installed',now)
             return False,'unverified_micro_rug_guard_not_installed',details
-        ok,reason,pool_details=self.micro_rug_guard.check(pair,now)
+        ok,reason,pool_details=guard.check(pair,now)
         if not ok:
             self.reasons[reason]+=1
+            self._v907_stage(e['mint'],pool,details.get('status','unknown'),
+                             pool_status,reason,now)
             return False,reason,dict(details,micro_pool_evidence=pool_details)
+        self.v907_full_risk_approvals+=1
+        self._v907_approved_mint_pool.add((e['mint'],pool))
+        self._v907_stage(e['mint'],pool,details.get('status','unknown'),
+                         'verified_burned_lp_and_screened_holders',
+                         'research_risk_pass',now)
         return True,'research_risk_pass',dict(details,micro_pool_evidence=pool_details)
 
     def allow(self,pair,e,now,*,min_cap_usd=5000.,require_volume5=True,
@@ -270,4 +361,10 @@ class ResearchRiskGate:
                 'momentum_rejections':dict(self.momentum.reasons),
                 'micro_rug_guard':(self.micro_rug_guard.stats() if self.micro_rug_guard else None),
                 'rpc_budget_remaining':max(0,self.max_rpc_per_minute-len(self.calls)),
-                'strict_missing_security':self.strict,'pending_rpc':len(self._pending)}
+                'strict_missing_security':self.strict,'pending_rpc':len(self._pending),
+                'v907_prefetch_calls':self.v907_prefetch_calls,
+                'v907_prefetch_submitted_approx':self.v907_prefetch_submitted,
+                'v907_mint_callbacks_consumed':self.v907_mint_callbacks_consumed,
+                'v907_full_risk_approvals':self.v907_full_risk_approvals,
+                'v907_unique_risk_approved_pools':len(self._v907_approved_mint_pool),
+                'v907_pending_mint_after_lp_verified':self.v907_pending_mint_after_pool_ready}

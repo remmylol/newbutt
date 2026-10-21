@@ -603,8 +603,30 @@ class AgeTrack:
                 (self.max_entry_market_cap_usd is None or
                  e['cap']<self.max_entry_market_cap_usd)):
             guard=getattr(self.research_risk_gate,'micro_rug_guard',None)
+            pool_prefetch_reason=None
             if guard is not None and hasattr(guard,'prefetch'):
-                guard.prefetch(pair,stamp)
+                _,pool_prefetch_reason,_=guard.prefetch(pair,stamp)
+            # V907: concurrently begin mint verification for *flow-eligible*
+            # micro pools rather than waiting until LP and history checks
+            # finish. The existing RPC/minute budget and mint security remain
+            # fully enforced. No quote or paper buy is authorized here.
+            if (hasattr(self.research_risk_gate,'prefetch_micro_mint') and
+                    self.eligible_new_mint(mint,max(8.,e['age'])
+                        if 7.<=e['age']<8. else e['age']) and
+                    pool_prefetch_reason not in (
+                        'unverified_lp_withdrawal_control',
+                        'concentrated_wallet_supply',
+                        'verified_sol_reserve_decline_20pct') and
+                    not flow_filter_reasons(pair,e,surge_change=surge_change,
+                        surge_volume=surge_volume,
+                        min_cap=self.min_entry_market_cap_usd,
+                        min_volume5_usd=self.min_entry_volume5_usd,
+                        max_change=self.max_entry_change5_pct,
+                        min_buys5=self.min_buys5,
+                        min_sells5=self.min_sells5,
+                        min_buy_sell_ratio=self.min_buy_sell_ratio,
+                        min_change5=self.min_change5)):
+                self.research_risk_gate.prefetch_micro_mint(mint,stamp)
         if not self.entry_age_allowed(e['age']):
             if self.name=='micro_0_60' and 5.<=e['age']<8.:
                 self.entry_filter_rejections['blocked_age_5_to_8m']=self.entry_filter_rejections.get('blocked_age_5_to_8m',0)+1
@@ -937,10 +959,16 @@ class BackgroundAgeStudy:
         pool_ready=(rug_guard.recently_completed_mints(stamp)
                     if rug_guard is not None and
                     hasattr(rug_guard,'recently_completed_mints') else set())
+        full_pool_ready=(rug_guard.recently_fully_verified_mints(stamp)
+                    if rug_guard is not None and
+                    hasattr(rug_guard,'recently_fully_verified_mints') else set())
+        mint_ready=(self.research_guard.recently_completed_mints(stamp)
+                    if self.research_guard is not None and
+                    hasattr(self.research_guard,'recently_completed_mints') else set())
         # Do not rely solely on pending_followups: a temporary security
         # rejection may have removed it while the quote completed. Inspect
         # both callback systems independently and deduplicate by mint.
-        candidates=set(micro.pending_followups)|quote_ready|pool_ready
+        candidates=set(micro.pending_followups)|quote_ready|pool_ready|full_pool_ready|mint_ready
         for mint in candidates:
             started=micro.pending_followups.get(mint,stamp)
             if (rug_guard is not None and
@@ -965,15 +993,15 @@ class BackgroundAgeStudy:
                 for key,pending in quote_pending.items()))
             # Only completed futures are urgent; avoid hammering incomplete ones.
             completed=(rpc is not None and rpc.done()) or ready_quote or (
-                mint in pool_ready) or (rug_guard is not None and rug_guard.completed(mint))
+                mint in pool_ready) or (mint in full_pool_ready) or (mint in mint_ready) or (rug_guard is not None and rug_guard.completed(mint))
             due_retry=stamp>=micro.retry_after.get(mint,float('inf'))
             last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))
             if (completed or due_retry) and stamp-last>=3:
                 # Finished two-sided quotes take priority over bare pool
                 # callbacks, but this only schedules a fresh candidate scan.
-                priority=(0 if ready_quote else 1 if mint in pool_ready else 2)
+                priority=(0 if ready_quote else 1 if mint in full_pool_ready else 2 if mint in mint_ready else 3 if mint in pool_ready else 4)
                 ready.append((priority,started,mint))
-                if priority<2:
+                if priority<4:
                     v902_log.info('V903 MICRO CALLBACK WAKE mint=%s quote_fresh=%s '
                         'pool_callback_recent=%s next_action=fresh_pair_and_all_gates '
                         'paper_only=True',mint,bool(ready_quote),mint in pool_ready)
@@ -1022,7 +1050,11 @@ class BackgroundAgeStudy:
         # checks in observe(). Cached LP evidence never constitutes approval.
         verified=[]
         if guard is not None and hasattr(guard,'prioritized_verified_mints'):
-            for mint in guard.prioritized_verified_mints(stamp):
+            full_ready=(guard.recently_fully_verified_mints(stamp)
+                if hasattr(guard,'recently_fully_verified_mints') else set())
+            for mint in sorted(guard.prioritized_verified_mints(stamp),
+                               key=lambda m: (m not in full_ready)):
+
                 born=self.hints.get(mint)
                 last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))
                 if (mint not in excluded and mint not in other_held and

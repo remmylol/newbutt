@@ -4287,6 +4287,9 @@ def run_background_age_study(*, scan_entries: bool) -> None:
     if _micro_v895_rug is not None and hasattr(_micro_v895_rug,'drain_completed'):
         with _age_study_lock:
             _micro_v895_rug.drain_completed(stamp)
+    if _v893_risk is not None and hasattr(_v893_risk,'drain_completed'):
+        with _age_study_lock:
+            _v893_risk.drain_completed(stamp)
     # Standard 3-study lookups stay unchanged. Under a genuine discovery
     # backlog, add up to three MICRO-ONLY lookups; never expand other tracks.
     # A completed async RPC/Jupiter result can also prompt a fresh-pair

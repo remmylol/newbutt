@@ -45,6 +45,8 @@ class MicroRugGuard:
         self.transient_provider_failures=0
         # Recently completed checks wake only the scheduler, never authorize buys.
         self._v903_recent_completions={}
+        self._v907_recent_full_reserve_proofs={} # scheduling only
+        self.v907_full_proofs=0
 
     def _snapshot(self,mint,pool,dex):
         """Normalize SOL/token by *mint identity*, not base/quote order.
@@ -472,7 +474,16 @@ class MicroRugGuard:
             self._note_unique(key,'verified_sol_reserve_decline_20pct')
             return False,'verified_sol_reserve_decline_20pct',result
         self._note_unique(key,'pool_rug_evidence_passed')
+        self._v907_recent_full_reserve_proofs[mint]=now
+        self.v907_full_proofs+=1
         return True,'verified_micro_rug_evidence_not_rug_proof',result
+
+    def recently_fully_verified_mints(self,now):
+        """Short-lived full reserve/LP scheduling hint, NOT authorization."""
+        for mint,when in tuple(self._v907_recent_full_reserve_proofs.items()):
+            if not 0<=now-when<=12:
+                self._v907_recent_full_reserve_proofs.pop(mint,None)
+        return set(self._v907_recent_full_reserve_proofs)
 
     def negative_pool_deferral_until(self,mint,now):
         """Delay redundant micro-only lookups when ALL known mint pools fail.
@@ -524,6 +535,8 @@ class MicroRugGuard:
                 'prefetch_attempts':self.prefetch_attempts,
                 'prefetch_submitted':self.prefetch_submitted,
                 'security_results_cached':len(self._security_cache),
+                'v907_full_pool_proofs':self.v907_full_proofs,
+                'v907_recent_full_proof_mints':len(self._v907_recent_full_reserve_proofs),
                 'v902_callbacks_consumed_snapshot':self.callbacks_consumed_snapshot,
                 'v902_callbacks_consumed_lp':self.callbacks_consumed_lp,
                 'v902_transient_provider_failures':self.transient_provider_failures,
