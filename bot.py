@@ -542,7 +542,10 @@ if LIVE_0_60_ENABLED:
     log.warning('LIVE PRIMARY CONFIGURED wallet=%s path=%s signer_loaded=True no_tx_sent_yet=True',
                 _broker.wallet,_live_file)
 _age_study_last_stats_at = 0.0
-_micro_fast_followup_window: list[float] = []  # max 12 extra fresh-pair queries/min
+_micro_fast_followup_window: list[float] = []  # max 24 shared micro followups/min
+# Up to 12 additional urgent held-position observations/min only when the
+# shared callback budget is exhausted; NEVER applies to entry research.
+_micro_urgent_reserve_window: list[float] = []
 _age_study_lock = threading.RLock()
 _age_ws = None
 _age_ws_fetch_guard = threading.Lock()
@@ -4296,6 +4299,8 @@ def run_background_age_study(*, scan_entries: bool) -> None:
     # recheck between ordinary entry scans (bounded at 12/min globally).
     _micro_fast_followup_window[:] = [t for t in _micro_fast_followup_window
                                       if stamp-t<60]
+    _micro_urgent_reserve_window[:] = [t for t in _micro_urgent_reserve_window
+                                       if stamp-t<60]
     extra_mints=set()
     due_mints=[]
     if api_cooldown_remaining()<=0:
@@ -4314,23 +4319,46 @@ def run_background_age_study(*, scan_entries: bool) -> None:
                 # verification followups. Fill spare lookup slots with ready
                 # candidates regardless of batch-discovery queue depth.
                 if V893_RESEARCH_ENABLED and normal_limit<6:
-                    micro_extra=_age_study.micro_extra_due(now=stamp,limit=max(0,6-len(due_mints)),exclude=due_mints)
+                    # v908: guarantee one bounded lookup lane for already
+                    # LP-verified pools with a mature on-chain reserve baseline.
+                    # This is ONLY a lookup, never a synthetic safety pass.
+                    history_due=_age_study.micro_history_due(
+                        now=stamp,limit=min(1,max(0,6-len(due_mints))),exclude=due_mints)
+                    due_mints.extend(history_due)
+                    extra_mints.update(history_due)
+                    micro_extra=_age_study.micro_extra_due(
+                        now=stamp,limit=max(0,6-len(due_mints)),exclude=due_mints)
                     extra_mints.update(micro_extra)
                     due_mints.extend(micro_extra)
+                    log.info('V908 MICRO RESERVE HISTORY SCHEDULER matured_reserved=%d '
+                             'micro_extra=%d total_due=%d fresh_pool_required=True',
+                             len(history_due),len(micro_extra),len(due_mints))
                 log.info('V897 MICRO LOOKUP SCHEDULER backlog_unscanned=%d normal_budget=%d micro_extra=%d '
                          'total_selected=%d extra_even_without_discovery_backlog=True',
                          unscanned,normal_limit,len(extra_mints),len(due_mints))
-            elif V893_RESEARCH_ENABLED and len(_micro_fast_followup_window)<24:
-                allowance=min(3,24-len(_micro_fast_followup_window))
-                urgent=_age_study.micro_urgent_held(now=stamp,limit=allowance)
-                follow=_age_study.micro_ready_followups(
-                    now=stamp,limit=allowance,exclude=urgent)
-                due_mints=(urgent+follow)[:allowance]
+            elif V893_RESEARCH_ENABLED:
+                allowance=min(3,max(0,24-len(_micro_fast_followup_window)))
+                if allowance:
+                    urgent=_age_study.micro_urgent_held(now=stamp,limit=allowance)
+                    follow=_age_study.micro_ready_followups(
+                        now=stamp,limit=max(0,allowance-len(urgent)),exclude=urgent)
+                    due_mints=(urgent+follow)[:allowance]
+                    _micro_fast_followup_window.extend(stamp for _ in due_mints)
+                else:
+                    # Urgent exits cannot be starved by 24/min entry callbacks.
+                    # This bounded, dedicated overflow never scans new mints.
+                    urgent_budget=max(0,12-len(_micro_urgent_reserve_window))
+                    due_mints=_age_study.micro_urgent_held(
+                        now=stamp,limit=min(3,urgent_budget)) if urgent_budget else []
+                    _micro_urgent_reserve_window.extend(stamp for _ in due_mints)
+                    if due_mints:
+                        log.warning('V908 MICRO URGENT EXIT RESERVED LOOKUPS count=%d '
+                                    'shared_callback_budget_exhausted=True paper_only=True',
+                                    len(due_mints))
                 extra_mints.update(due_mints)
-                _micro_fast_followup_window.extend(stamp for _ in due_mints)
                 if due_mints:
-                    log.info('V895 MICRO FAST RECHECK held_age5_or_pending_and_ready=%d fresh_pool_recheck=True '
-                             'no_stale_fill=True',len(due_mints))
+                    log.info('V895 MICRO FAST RECHECK held_age5_or_pending_and_ready=%d '
+                             'fresh_pool_recheck=True no_stale_fill=True',len(due_mints))
         for mint in due_mints:
             try:
                 current=token_pairs(mint)

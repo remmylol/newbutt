@@ -939,6 +939,37 @@ class BackgroundAgeStudy:
                     if m not in selected:selected.append(m)
         return selected
 
+    def micro_history_due(self, *, now:float|None=None, limit:int=1, exclude=()):
+        """Fresh-pool lookup slots for LP-verified pools needing 60s reserve history.
+
+        The guard supplies hints from ACTUAL independent on-chain samples.
+        The scheduler never uses the old sample to approve an entry.
+        """
+        stamp=time.time() if now is None else now
+        micro=next((t for t in self.tracks if t.name=='micro_0_60'),None)
+        if micro is None or limit<=0:return []
+        micro.load()
+        if micro.read_only or len(micro.positions)>=micro.max_positions or micro.cash<micro.size:
+            return []
+        guard=getattr(self.research_guard,'micro_rug_guard',None)
+        if guard is None or not hasattr(guard,'reserve_history_recheck_mints'):
+            return []
+        blocked=set(exclude)|set(micro.positions)
+        other_held={m for track in self.tracks if track is not micro
+                    for m in track.positions}
+        result=[]
+        for mint in guard.reserve_history_recheck_mints(stamp):
+            born=self.hints.get(mint)
+            last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))
+            if (mint in blocked or mint in other_held or born is None or
+                    not 0<=stamp-born<3600 or
+                    not micro.eligible_new_mint(mint,(stamp-born)/60) or
+                    stamp-last<6):
+                continue
+            result.append(mint)
+            if len(result)>=limit:break
+        return result
+
     def micro_ready_followups(self, *, now:float|None=None, limit:int=2, exclude=()):
         """Ready async RPC/quote callbacks get a fresh-pool retry, not a stale fill."""
         stamp=time.time() if now is None else now
@@ -962,13 +993,16 @@ class BackgroundAgeStudy:
         full_pool_ready=(rug_guard.recently_fully_verified_mints(stamp)
                     if rug_guard is not None and
                     hasattr(rug_guard,'recently_fully_verified_mints') else set())
+        # v908: a real 60s reserve baseline has matured but still needs a
+        # new on-chain sample; include this independently of recent callbacks.
+        history_ready=set(self.micro_history_due(now=stamp,limit=24,exclude=excluded))
         mint_ready=(self.research_guard.recently_completed_mints(stamp)
                     if self.research_guard is not None and
                     hasattr(self.research_guard,'recently_completed_mints') else set())
         # Do not rely solely on pending_followups: a temporary security
         # rejection may have removed it while the quote completed. Inspect
         # both callback systems independently and deduplicate by mint.
-        candidates=set(micro.pending_followups)|quote_ready|pool_ready|full_pool_ready|mint_ready
+        candidates=set(micro.pending_followups)|quote_ready|pool_ready|full_pool_ready|mint_ready|history_ready
         for mint in candidates:
             started=micro.pending_followups.get(mint,stamp)
             if (rug_guard is not None and
@@ -993,15 +1027,18 @@ class BackgroundAgeStudy:
                 for key,pending in quote_pending.items()))
             # Only completed futures are urgent; avoid hammering incomplete ones.
             completed=(rpc is not None and rpc.done()) or ready_quote or (
-                mint in pool_ready) or (mint in full_pool_ready) or (mint in mint_ready) or (rug_guard is not None and rug_guard.completed(mint))
+                mint in pool_ready) or (mint in full_pool_ready) or (mint in mint_ready) or (
+                mint in history_ready) or (rug_guard is not None and rug_guard.completed(mint))
             due_retry=stamp>=micro.retry_after.get(mint,float('inf'))
             last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))
             if (completed or due_retry) and stamp-last>=3:
                 # Finished two-sided quotes take priority over bare pool
                 # callbacks, but this only schedules a fresh candidate scan.
-                priority=(0 if ready_quote else 1 if mint in full_pool_ready else 2 if mint in mint_ready else 3 if mint in pool_ready else 4)
+                priority=(0 if ready_quote else 1 if mint in full_pool_ready else
+                          2 if mint in history_ready else 3 if mint in mint_ready else
+                          4 if mint in pool_ready else 5)
                 ready.append((priority,started,mint))
-                if priority<4:
+                if priority<5:
                     v902_log.info('V903 MICRO CALLBACK WAKE mint=%s quote_fresh=%s '
                         'pool_callback_recent=%s next_action=fresh_pair_and_all_gates '
                         'paper_only=True',mint,bool(ready_quote),mint in pool_ready)
@@ -1017,7 +1054,7 @@ class BackgroundAgeStudy:
             last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))
             if (stamp>=retry_at and stamp-last>=3 and
                 mint not in excluded and mint not in other_held):
-                ready.append((2,retry_at,mint))
+                ready.append((5,retry_at,mint))
         return list(dict.fromkeys(mint for _,_,mint in sorted(ready)))[:limit]
 
     def micro_extra_due(self, *, now:float|None=None, limit:int=3, exclude=()):
@@ -1032,9 +1069,26 @@ class BackgroundAgeStudy:
         other_held={m for t in self.tracks if t is not micro for m in t.positions}
         ready=self.micro_ready_followups(now=stamp,limit=limit,exclude=excluded)
         excluded.update(ready)
+        # A known outstanding mint / pool RPC is already making progress.
+        # Don't repeatedly spend scarce DexScreener requests until it
+        # completes; the callback drain and explicit retry queue wake it.
+        # The short horizon keeps transient provider failures recoverable.
+        inflight=set()
+        for mint,future in (getattr(self.research_guard,'_pending',{}) or {}).items():
+            if not future.done():inflight.add(mint)
+        if guard := getattr(self.research_guard,'micro_rug_guard',None):
+            for (mint,pool),future in (getattr(guard,'_pending',{}) or {}).items():
+                if not future.done():inflight.add(mint)
+            for (mint,pool),future in (getattr(guard,'_security_pending',{}) or {}).items():
+                if not future.done():inflight.add(mint)
+        history=self.micro_history_due(now=stamp,limit=limit,exclude=excluded)
+        excluded.update(history)
         fresh=[]; older=[]
         guard=getattr(self.research_guard,'micro_rug_guard',None)
         for mint,born in self.hints.items():
+            if (mint in inflight and
+                    stamp-max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))<18):
+                continue
             if (guard is not None and hasattr(guard,'negative_pool_deferral_until') and
                 guard.negative_pool_deferral_until(mint,stamp)):
                 continue
@@ -1054,7 +1108,9 @@ class BackgroundAgeStudy:
                 if hasattr(guard,'recently_fully_verified_mints') else set())
             for mint in sorted(guard.prioritized_verified_mints(stamp),
                                key=lambda m: (m not in full_ready)):
-
+                if (mint in inflight and
+                        stamp-max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))<18):
+                    continue
                 born=self.hints.get(mint)
                 last=max(self.last_lookup.get(mint,0),self.micro_last_lookup.get(mint,0))
                 if (mint not in excluded and mint not in other_held and
@@ -1075,6 +1131,10 @@ class BackgroundAgeStudy:
         # Fresh completed quotes/callbacks are genuinely time critical and
         # must NEVER be dropped to make space for brand-new discovery.
         candidates=ready[:limit]
+        # A missing second reserve observation must not get stuck behind
+        # arbitrary verified-pool rotation. Completed *fresh* quote wakes
+        # stay first and are never displaced by this lane.
+        candidates.extend(history[:max(0,limit-len(candidates))])
         reserve_fresh=(limit>=2 and bool(fresh) and len(candidates)<limit)
         verified_budget=max(0,limit-len(candidates)-int(reserve_fresh))
         candidates.extend(verified[:verified_budget])

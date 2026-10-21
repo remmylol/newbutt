@@ -485,6 +485,33 @@ class MicroRugGuard:
                 self._v907_recent_full_reserve_proofs.pop(mint,None)
         return set(self._v907_recent_full_reserve_proofs)
 
+    def reserve_history_recheck_mints(self,now):
+        """Mint hints whose LP is verified and reserve-history follow-up is due.
+
+        Requires a real stored on-chain baseline roughly 60-130s old.
+        This never grants entry: a NEW snapshot, current pool risk and the
+        entire allow_micro/Jupiter pipeline must still pass. Skip currently
+        running RPCs and pools already proved to have complete reserve history.
+        """
+        due={}
+        for key,(seen,security) in tuple(self._security_cache.items()):
+            mint,pool=key
+            if (security.get('status')!='verified_burned_lp_and_screened_holders'
+                    or not 0<=now-seen<self._security_ttl(security.get('status'))
+                    or 'pool_rug_evidence_passed' in self._unique_statuses.get(key,())):
+                continue
+            task=self._pending.get(key)
+            if task is not None and not task.done():
+                continue
+            baseline=[t for t,sol,tokens in self.history.get(key,())
+                      if 60<=now-t<=148 and sol>0 and tokens>0]
+            if not baseline:
+                continue
+            # The oldest still-eligible baseline expires first; prioritize it.
+            deadline=min(t+148 for t in baseline)
+            due[mint]=min(deadline,due.get(mint,float('inf')))
+        return [mint for mint,_ in sorted(due.items(),key=lambda item:(item[1],item[0]))]
+
     def negative_pool_deferral_until(self,mint,now):
         """Delay redundant micro-only lookups when ALL known mint pools fail.
 
